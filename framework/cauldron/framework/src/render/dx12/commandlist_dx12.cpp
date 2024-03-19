@@ -56,8 +56,7 @@ namespace cauldron
     CommandListInternal::~CommandListInternal()
     {
         // Release command allocator on delete
-        if (m_pCmdAllocator)
-            GetDevice()->GetImpl()->ReleaseCommandAllocator(this);
+        GetDevice()->GetImpl()->ReleaseCommandAllocator(this);
     }
 
     //////////////////////////////////////////////////////////////////////////
@@ -187,13 +186,7 @@ namespace cauldron
 
     void ClearUAVFloat(CommandList* pCmdList, const GPUResource* pResource, const ResourceViewInfo* pGPUView, const ResourceViewInfo* pCPUView, float clearColor[4])
     {
-        uint32_t clearColorAsUint[4];
-        clearColorAsUint[0] = reinterpret_cast<uint32_t&> (clearColor[0]);
-        clearColorAsUint[1] = reinterpret_cast<uint32_t&> (clearColor[1]);
-        clearColorAsUint[2] = reinterpret_cast<uint32_t&> (clearColor[2]);
-        clearColorAsUint[3] = reinterpret_cast<uint32_t&> (clearColor[3]);
-    
-        pCmdList->GetImpl()->DX12CmdList()->ClearUnorderedAccessViewUint(pGPUView->GetImpl()->hGPUHandle, pCPUView->GetImpl()->hCPUHandle, const_cast<GPUResource*>(pResource)->GetImpl()->DX12Resource(), clearColorAsUint, 0, nullptr);
+        pCmdList->GetImpl()->DX12CmdList()->ClearUnorderedAccessViewFloat(pGPUView->GetImpl()->hGPUHandle, pCPUView->GetImpl()->hCPUHandle, const_cast<GPUResource*>(pResource)->GetImpl()->DX12Resource(), clearColor, 0, nullptr);
     }
 
     void SetPipelineState(CommandList* pCmdList, PipelineObject* pPipeline)

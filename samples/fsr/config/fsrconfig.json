@@ -1,6 +1,5 @@
 {
     "FidelityFX FSR": {
-        "MotionVectorGeneration": "GBufferRenderModule",
 
         "RenderResources": {
             "ReactiveMask": {
@@ -12,30 +11,6 @@
                 "Format": "R8_UNORM",
                 "AllowUAV": true,
                 "RenderResolution": false
-            },
-            "UiTarget0_LDR8": {
-                "Format": "RGBA8_UNORM",
-                "RenderResolution": false
-            },
-            "UiTarget1_LDR8": {
-                "Format": "RGBA8_UNORM",
-                "RenderResolution": false
-            },
-            "UiTarget0_HDR10": {
-                "Format": "RGB10A2_UNORM",
-                "RenderResolution": false
-            },
-            "UiTarget1_HDR10": {
-                "Format": "RGB10A2_UNORM",
-                "RenderResolution": false
-            },
-            "UiTarget0_HDR16": {
-                "Format": "RGBA16_FLOAT",
-                "RenderResolution": false
-            },
-            "UiTarget1_HDR16": {
-                "Format": "RGBA16_FLOAT",
-                "RenderResolution": false
             }
         },
 
@@ -44,13 +19,10 @@
             "RasterShadowRenderModule",
             "GBufferRenderModule",
             "LightingRenderModule",
-            "AnimatedTexturesRenderModule",
             "TranslucencyRenderModule",
             "GPUParticleRenderModule",
             "TAARenderModule",
             "FSR2RenderModule",
-            "FSR3UpscaleRenderModule",
-            "FSR3RenderModule",
             "UpscaleRenderModule",
             "ToneMappingRenderModule",
             "FSR1RenderModule"
@@ -80,7 +52,7 @@
                     "Emitters": [
                         {
                             "Name": "Smoke",
-                            "SpawnOffset": [ 6.0, 0.0, 1.4 ],
+                            "SpawnOffset": [ 0.0, 0.0, 1.4 ],
                             "SpawnOffsetVariance": [ 0.1, 0.0, 0.1 ],
                             "SpawnVelocity": [ 0.0, 0.2, 0.0 ],
                             "SpawnVelocityVariance": 1.0,
@@ -97,7 +69,7 @@
                         },
                         {
                             "Name": "Spark",
-                            "SpawnOffset": [ -3.0, 0.0, -1.4 ],
+                            "SpawnOffset": [ 0.0, 0.0, -1.4 ],
                             "SpawnOffsetVariance": [ 0.05, 0.0, 0.05 ],
                             "SpawnVelocity": [ 0.0, 4.0, 0.0 ],
                             "SpawnVelocityVariance": 0.5,
@@ -115,12 +87,6 @@
                     ]
                 }
             ]
-        },
-
-        "FPSLimiter": {
-            "Enable": true,
-            "UseGPULimiter": false,
-            "TargetFPS": 60
         }
     }
 }

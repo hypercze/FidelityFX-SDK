@@ -127,6 +127,11 @@ enum class DisplayMode
     DISPLAYMODE_FSHDR_SCRGB
 };
 
+struct SwapchainCBData
+{
+    DisplayMode displayMode;
+};
+
 
 #if !__cplusplus
 struct MaterialInfo

@@ -69,7 +69,7 @@ const size_t scratchBufferSize = ffxGetScratchMemorySize(FFX_FSR1_CONTEXT_COUNT)
 Allocate the scratch memory for the backend and retrieve the interface using `ffxGetInterface`:
 
 ```C++
-void* scratchBuffer  = calloc(scratchBufferSize, 1);
+void* scratchBuffer  = malloc(scratchBufferSize);
 FfxErrorCode errorCode = ffxGetInterface(&backendInterface, DevicePtr(), scratchBuffer, scratchBufferSize, FFX_FSR1_CONTEXT_COUNT);
 FFX_ASSERT(errorCode == FFX_OK);
 ```

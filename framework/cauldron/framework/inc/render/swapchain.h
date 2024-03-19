@@ -115,14 +115,6 @@ namespace cauldron
          * @brief   Executes device presentation of the swapchain.
          */
         virtual void Present() = 0;
-        virtual void GetLastPresentCount(UINT* pLastPresentCount)
-        {
-            *pLastPresentCount = 0;
-        }
-        virtual void GetRefreshRate(double* outRefreshRate)
-        {
-            *outRefreshRate = 0.0;
-        }
 
         /**
          * @brief   Creates a screenshot of the current swap chain.

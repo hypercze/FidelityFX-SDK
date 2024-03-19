@@ -1,33 +1,32 @@
 // This file is part of the FidelityFX SDK.
-// 
-// Copyright (c) 2023 Advanced Micro Devices, Inc. All rights reserved.
-// 
+//
+// Copyright © 2023 Advanced Micro Devices, Inc.
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
+// of this software and associated documentation files(the “Software”), to deal
 // in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
 // copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
+// furnished to do so, subject to the following conditions :
+//
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
-// 
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//
+// THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
-
 
 #include <FidelityFX/host/ffx_interface.h>
 #include <FidelityFX/host/ffx_util.h>
 #include <FidelityFX/host/ffx_assert.h>
 #include <FidelityFX/host/backends/dx12/ffx_dx12.h>
 #include <FidelityFX/host/backends/dx12/d3dx12.h>
-#include <../src/backends/shared/ffx_shader_blobs.h>
+#include <ffx_shader_blobs.h>
 #include <codecvt>  // convert string to wstring
-#include <mutex>
 
 // DX12 prototypes for functions in the backend interface
 FfxUInt32 GetSDKVersionDX12(FfxInterface* backendInterface);
@@ -35,7 +34,7 @@ FfxErrorCode CreateBackendContextDX12(FfxInterface* backendInterface, FfxUInt32*
 FfxErrorCode GetDeviceCapabilitiesDX12(FfxInterface* backendInterface, FfxDeviceCapabilities* deviceCapabilities);
 FfxErrorCode DestroyBackendContextDX12(FfxInterface* backendInterface, FfxUInt32 effectContextId);
 FfxErrorCode CreateResourceDX12(FfxInterface* backendInterface, const FfxCreateResourceDescription* desc, FfxUInt32 effectContextId, FfxResourceInternal* outTexture);
-FfxErrorCode DestroyResourceDX12(FfxInterface* backendInterface, FfxResourceInternal resource, FfxUInt32 effectContextId);
+FfxErrorCode DestroyResourceDX12(FfxInterface* backendInterface, FfxResourceInternal resource);
 FfxErrorCode RegisterResourceDX12(FfxInterface* backendInterface, const FfxResource* inResource, FfxUInt32 effectContextId, FfxResourceInternal* outResourceInternal);
 FfxResource GetResourceDX12(FfxInterface* backendInterface, FfxResourceInternal resource);
 FfxErrorCode UnregisterResourcesDX12(FfxInterface* backendInterface, FfxCommandList commandList, FfxUInt32 effectContextId);
@@ -46,6 +45,10 @@ FfxErrorCode ScheduleGpuJobDX12(FfxInterface* backendInterface, const FfxGpuJobD
 FfxErrorCode ExecuteGpuJobsDX12(FfxInterface* backendInterface, FfxCommandList commandList);
 
 #define FFX_MAX_RESOURCE_IDENTIFIER_COUNT   (128)
+
+// To track parallel effect context usage
+static uint32_t s_BackendRefCount = 0;
+static size_t   s_MaxEffectContexts = 0;
 
 typedef struct BackendContext_DX12 {
 
@@ -64,16 +67,10 @@ typedef struct BackendContext_DX12 {
         uint32_t                uavDescCount;
     } Resource;
 
-    uint32_t refCount;
-    uint32_t maxEffectContexts;
-
     ID3D12Device*           device = nullptr;
 
     FfxGpuJobDescription*   pGpuJobs;
     uint32_t                gpuJobCount;
-
-    uint32_t                nextRtvDescriptor;
-    ID3D12DescriptorHeap*   descHeapRtvCpu;
 
     ID3D12DescriptorHeap*   descHeapSrvCpu;
     ID3D12DescriptorHeap*   descHeapUavCpu;
@@ -87,7 +84,6 @@ typedef struct BackendContext_DX12 {
     ID3D12Resource*         constantBufferResource;
     uint32_t                constantBufferSize;
     uint32_t                constantBufferOffset;
-    std::mutex              constantBufferMutex;
 
     D3D12_RESOURCE_BARRIER  barriers[FFX_MAX_BARRIERS];
     uint32_t                barrierCount;
@@ -135,8 +131,11 @@ FfxErrorCode ffxGetInterfaceDX12(
     FfxDevice device,
     void* scratchBuffer,
     size_t scratchBufferSize,
-    uint32_t maxContexts) {
+    size_t maxContexts) {
 
+    FFX_RETURN_ON_ERROR(
+        !s_BackendRefCount,
+        FFX_ERROR_BACKEND_API_ERROR);
     FFX_RETURN_ON_ERROR(
         backendInterface,
         FFX_ERROR_INVALID_POINTER);
@@ -158,30 +157,19 @@ FfxErrorCode ffxGetInterfaceDX12(
     backendInterface->fpUnregisterResources = UnregisterResourcesDX12;
     backendInterface->fpGetResourceDescription = GetResourceDescriptorDX12;
     backendInterface->fpCreatePipeline = CreatePipelineDX12;
-    backendInterface->fpGetPermutationBlobByIndex = ffxGetPermutationBlobByIndex;
     backendInterface->fpDestroyPipeline = DestroyPipelineDX12;
     backendInterface->fpScheduleGpuJob = ScheduleGpuJobDX12;
     backendInterface->fpExecuteGpuJobs = ExecuteGpuJobsDX12;
-    backendInterface->fpSwapChainConfigureFrameGeneration = ffxSetFrameGenerationConfigToSwapchainDX12;
 
     // Memory assignments
     backendInterface->scratchBuffer = scratchBuffer;
     backendInterface->scratchBufferSize = scratchBufferSize;
 
-    BackendContext_DX12* backendContext = (BackendContext_DX12*)backendInterface->scratchBuffer;
-
-    FFX_RETURN_ON_ERROR(
-        !backendContext->refCount,
-        FFX_ERROR_BACKEND_API_ERROR);
-
-    // Clear everything out
-    memset(backendContext, 0, sizeof(*backendContext));
-
     // Set the device
     backendInterface->device = device;
 
     // Assign the max number of contexts we'll be using
-    backendContext->maxEffectContexts = (uint32_t)maxContexts;
+    s_MaxEffectContexts = maxContexts;
 
     return FFX_OK;
 }
@@ -193,13 +181,13 @@ FfxCommandList ffxGetCommandListDX12(ID3D12CommandList* cmdList)
 }
 
 // register a DX12 resource to the backend
-FfxResource ffxGetResourceDX12(const ID3D12Resource* dx12Resource,
+FfxResource ffxGetResourceDX12(ID3D12Resource* dx12Resource,
     FfxResourceDescription                     ffxResDescription,
     wchar_t* ffxResName,
     FfxResourceStates                          state /*=FFX_RESOURCE_STATE_COMPUTE_READ*/)
 {
     FfxResource resource = {};
-    resource.resource    = reinterpret_cast<void*>(const_cast<ID3D12Resource*>(dx12Resource));
+    resource.resource = reinterpret_cast<void*>(dx12Resource);
     resource.state = state;
     resource.description = ffxResDescription;
 
@@ -296,15 +284,8 @@ static DXGI_FORMAT convertFormatSrv(DXGI_FORMAT format)
     case DXGI_FORMAT_D16_UNORM:
         return DXGI_FORMAT_R16_UNORM;
 
-        // Handle Color
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-        return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        return DXGI_FORMAT_R8G8B8A8_UNORM;
-
-        // Others can map as is
+        // Colors can map as is
     default:
-
         return format;
     }
 }
@@ -313,13 +294,13 @@ D3D12_RESOURCE_STATES ffxGetDX12StateFromResourceState(FfxResourceStates state)
 {
     switch (state) {
 
-        case (FFX_RESOURCE_STATE_GENERIC_READ):
+        case(FFX_RESOURCE_STATE_GENERIC_READ):
             return D3D12_RESOURCE_STATE_GENERIC_READ;
-        case (FFX_RESOURCE_STATE_UNORDERED_ACCESS):
+        case(FFX_RESOURCE_STATE_UNORDERED_ACCESS):
             return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         case (FFX_RESOURCE_STATE_PIXEL_COMPUTE_READ):
             return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        case (FFX_RESOURCE_STATE_COMPUTE_READ):
+        case(FFX_RESOURCE_STATE_COMPUTE_READ):
             return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         case (FFX_RESOURCE_STATE_PIXEL_READ):
             return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -329,12 +310,6 @@ D3D12_RESOURCE_STATES ffxGetDX12StateFromResourceState(FfxResourceStates state)
             return D3D12_RESOURCE_STATE_COPY_DEST;
         case FFX_RESOURCE_STATE_INDIRECT_ARGUMENT:
             return D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-        case FFX_RESOURCE_STATE_PRESENT:
-            return D3D12_RESOURCE_STATE_PRESENT;
-        case FFX_RESOURCE_STATE_COMMON:
-            return D3D12_RESOURCE_STATE_COMMON;
-        case FFX_RESOURCE_STATE_RENDER_TARGET:
-            return D3D12_RESOURCE_STATE_RENDER_TARGET;
         default:
             FFX_ASSERT_MESSAGE(false, "Resource state not yet supported");
             return D3D12_RESOURCE_STATE_COMMON;
@@ -345,53 +320,43 @@ DXGI_FORMAT ffxGetDX12FormatFromSurfaceFormat(FfxSurfaceFormat surfaceFormat)
 {
     switch (surfaceFormat) {
 
-        case (FFX_SURFACE_FORMAT_R32G32B32A32_TYPELESS):
+        case(FFX_SURFACE_FORMAT_R32G32B32A32_TYPELESS):
             return DXGI_FORMAT_R32G32B32A32_TYPELESS;
-        case (FFX_SURFACE_FORMAT_R32G32B32A32_FLOAT):
+        case(FFX_SURFACE_FORMAT_R32G32B32A32_FLOAT):
             return DXGI_FORMAT_R32G32B32A32_FLOAT;
-        case (FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT):
+        case(FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT):
             return DXGI_FORMAT_R16G16B16A16_FLOAT;
-        case (FFX_SURFACE_FORMAT_R32G32_FLOAT):
+        case(FFX_SURFACE_FORMAT_R32G32_FLOAT):
             return DXGI_FORMAT_R32G32_FLOAT;
-        case (FFX_SURFACE_FORMAT_R32_UINT):
+        case(FFX_SURFACE_FORMAT_R32_UINT):
             return DXGI_FORMAT_R32_UINT;
-        case(FFX_SURFACE_FORMAT_R10G10B10A2_UNORM):
-            return DXGI_FORMAT_R10G10B10A2_UNORM;
-        case (FFX_SURFACE_FORMAT_R8G8B8A8_TYPELESS):
+        case(FFX_SURFACE_FORMAT_R8G8B8A8_TYPELESS):
             return DXGI_FORMAT_R8G8B8A8_TYPELESS;
-        case (FFX_SURFACE_FORMAT_R8G8B8A8_UNORM):
+        case(FFX_SURFACE_FORMAT_R8G8B8A8_UNORM):
             return DXGI_FORMAT_R8G8B8A8_UNORM;
-        case (FFX_SURFACE_FORMAT_R8G8B8A8_SRGB):
-            return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        case (FFX_SURFACE_FORMAT_R8G8B8A8_SNORM):
+        case(FFX_SURFACE_FORMAT_R8G8B8A8_SNORM):
             return DXGI_FORMAT_R8G8B8A8_SNORM;
-        case (FFX_SURFACE_FORMAT_R11G11B10_FLOAT):
+        case(FFX_SURFACE_FORMAT_R11G11B10_FLOAT):
             return DXGI_FORMAT_R11G11B10_FLOAT;
-        case (FFX_SURFACE_FORMAT_R16G16_FLOAT):
+        case(FFX_SURFACE_FORMAT_R16G16_FLOAT):
             return DXGI_FORMAT_R16G16_FLOAT;
-        case (FFX_SURFACE_FORMAT_R16G16_UINT):
+        case(FFX_SURFACE_FORMAT_R16G16_UINT):
             return DXGI_FORMAT_R16G16_UINT;
-        case (FFX_SURFACE_FORMAT_R16G16_SINT):
-            return DXGI_FORMAT_R16G16_SINT;
-        case (FFX_SURFACE_FORMAT_R16_FLOAT):
+        case(FFX_SURFACE_FORMAT_R16_FLOAT):
             return DXGI_FORMAT_R16_FLOAT;
-        case (FFX_SURFACE_FORMAT_R16_UINT):
+        case(FFX_SURFACE_FORMAT_R16_UINT):
             return DXGI_FORMAT_R16_UINT;
-        case (FFX_SURFACE_FORMAT_R16_UNORM):
+        case(FFX_SURFACE_FORMAT_R16_UNORM):
             return DXGI_FORMAT_R16_UNORM;
-        case (FFX_SURFACE_FORMAT_R16_SNORM):
+        case(FFX_SURFACE_FORMAT_R16_SNORM):
             return DXGI_FORMAT_R16_SNORM;
-        case (FFX_SURFACE_FORMAT_R8_UNORM):
+        case(FFX_SURFACE_FORMAT_R8_UNORM):
             return DXGI_FORMAT_R8_UNORM;
-        case (FFX_SURFACE_FORMAT_R8_UINT):
-            return DXGI_FORMAT_R8_UINT;
-        case (FFX_SURFACE_FORMAT_R8G8_UINT):
-            return DXGI_FORMAT_R8G8_UINT;
-        case (FFX_SURFACE_FORMAT_R8G8_UNORM):
+        case(FFX_SURFACE_FORMAT_R8G8_UNORM):
             return DXGI_FORMAT_R8G8_UNORM;
-        case (FFX_SURFACE_FORMAT_R32_FLOAT):
+        case(FFX_SURFACE_FORMAT_R32_FLOAT):
             return DXGI_FORMAT_R32_FLOAT;
-        case (FFX_SURFACE_FORMAT_UNKNOWN):
+        case(FFX_SURFACE_FORMAT_UNKNOWN):
             return DXGI_FORMAT_UNKNOWN;
 
         default:
@@ -416,188 +381,45 @@ FfxSurfaceFormat ffxGetSurfaceFormatDX12(DXGI_FORMAT format)
             return FFX_SURFACE_FORMAT_R32G32B32A32_TYPELESS;
         case(DXGI_FORMAT_R32G32B32A32_FLOAT):
             return FFX_SURFACE_FORMAT_R32G32B32A32_FLOAT;
-        case DXGI_FORMAT_R32G32B32A32_UINT:
-            return FFX_SURFACE_FORMAT_R32G32B32A32_UINT;
-        //case DXGI_FORMAT_R32G32B32A32_SINT:
-        //case DXGI_FORMAT_R32G32B32_TYPELESS:
-        //case DXGI_FORMAT_R32G32B32_FLOAT:
-        //case DXGI_FORMAT_R32G32B32_UINT:
-        //case DXGI_FORMAT_R32G32B32_SINT:
-
-        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
         case(DXGI_FORMAT_R16G16B16A16_FLOAT):
             return FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT;
-        //case DXGI_FORMAT_R16G16B16A16_UNORM:
-        //case DXGI_FORMAT_R16G16B16A16_UINT:
-        //case DXGI_FORMAT_R16G16B16A16_SNORM:
-        //case DXGI_FORMAT_R16G16B16A16_SINT:
-
-        case DXGI_FORMAT_R32G32_TYPELESS:
-        case DXGI_FORMAT_R32G32_FLOAT:
+        case(DXGI_FORMAT_R32G32_FLOAT):
             return FFX_SURFACE_FORMAT_R32G32_FLOAT;
-        //case DXGI_FORMAT_R32G32_FLOAT:
-        //case DXGI_FORMAT_R32G32_UINT:
-        //case DXGI_FORMAT_R32G32_SINT:
-
-        case DXGI_FORMAT_R32G8X24_TYPELESS:
-        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-            return FFX_SURFACE_FORMAT_R32_FLOAT;
-
-        case DXGI_FORMAT_R24G8_TYPELESS:
-        case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case(DXGI_FORMAT_R32_UINT):
             return FFX_SURFACE_FORMAT_R32_UINT;
-
-        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
-        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
-            return FFX_SURFACE_FORMAT_R8_UINT;
-
-        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-        case DXGI_FORMAT_R10G10B10A2_UNORM:
-            return FFX_SURFACE_FORMAT_R10G10B10A2_UNORM;
-        //case DXGI_FORMAT_R10G10B10A2_UINT:
-        
-        case (DXGI_FORMAT_R11G11B10_FLOAT):
-            return FFX_SURFACE_FORMAT_R11G11B10_FLOAT;
-
-        case (DXGI_FORMAT_R8G8B8A8_TYPELESS):
-            return FFX_SURFACE_FORMAT_R8G8B8A8_TYPELESS;
-        case (DXGI_FORMAT_R8G8B8A8_UNORM):
-            return FFX_SURFACE_FORMAT_R8G8B8A8_UNORM;
-        case (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB):
-            return FFX_SURFACE_FORMAT_R8G8B8A8_SRGB;
-        //case DXGI_FORMAT_R8G8B8A8_UINT:
-        case DXGI_FORMAT_R8G8B8A8_SNORM:
-            return FFX_SURFACE_FORMAT_R8G8B8A8_SNORM;
-
-        case DXGI_FORMAT_R16G16_TYPELESS:
-        case (DXGI_FORMAT_R16G16_FLOAT):
-            return FFX_SURFACE_FORMAT_R16G16_FLOAT;
-        //case DXGI_FORMAT_R16G16_UNORM:
-        case (DXGI_FORMAT_R16G16_UINT):
-            return FFX_SURFACE_FORMAT_R16G16_UINT;
-        //case DXGI_FORMAT_R16G16_SNORM
-        //case DXGI_FORMAT_R16G16_SINT 
-
-        //case DXGI_FORMAT_R32_SINT:
-        case DXGI_FORMAT_R32_UINT:
-            return FFX_SURFACE_FORMAT_R32_UINT;
-        case DXGI_FORMAT_R32_TYPELESS:
         case(DXGI_FORMAT_D32_FLOAT):
         case(DXGI_FORMAT_R32_FLOAT):
             return FFX_SURFACE_FORMAT_R32_FLOAT;
-
-        case DXGI_FORMAT_R8G8_TYPELESS:
-        case (DXGI_FORMAT_R8G8_UINT):
-            return FFX_SURFACE_FORMAT_R8G8_UINT;
-        //case DXGI_FORMAT_R8G8_UNORM:
-        //case DXGI_FORMAT_R8G8_SNORM:
-        //case DXGI_FORMAT_R8G8_SINT:
-
-        case DXGI_FORMAT_R16_TYPELESS:
-        case (DXGI_FORMAT_R16_FLOAT):
+        case(DXGI_FORMAT_R8G8B8A8_TYPELESS):
+            return FFX_SURFACE_FORMAT_R8G8B8A8_TYPELESS;
+        case(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB):
+            return FFX_SURFACE_FORMAT_R8G8B8A8_SRGB;
+        case(DXGI_FORMAT_R8G8B8A8_UNORM):
+            return FFX_SURFACE_FORMAT_R8G8B8A8_UNORM;
+        case(DXGI_FORMAT_R11G11B10_FLOAT):
+            return FFX_SURFACE_FORMAT_R11G11B10_FLOAT;
+        case(DXGI_FORMAT_R16G16_FLOAT):
+            return FFX_SURFACE_FORMAT_R16G16_FLOAT;
+        case(DXGI_FORMAT_R16G16_UINT):
+            return FFX_SURFACE_FORMAT_R16G16_UINT;
+        case(DXGI_FORMAT_R16_FLOAT):
             return FFX_SURFACE_FORMAT_R16_FLOAT;
-        case (DXGI_FORMAT_R16_UINT):
+        case(DXGI_FORMAT_R16_UINT):
             return FFX_SURFACE_FORMAT_R16_UINT;
-        case DXGI_FORMAT_D16_UNORM:
-        case (DXGI_FORMAT_R16_UNORM):
+        case(DXGI_FORMAT_R16_UNORM):
             return FFX_SURFACE_FORMAT_R16_UNORM;
-        case (DXGI_FORMAT_R16_SNORM):
+        case(DXGI_FORMAT_R16_SNORM):
             return FFX_SURFACE_FORMAT_R16_SNORM;
-        //case DXGI_FORMAT_R16_SINT:
-
-        case DXGI_FORMAT_R8_TYPELESS:
-        case DXGI_FORMAT_R8_UNORM:
-        case DXGI_FORMAT_A8_UNORM:
+        case(DXGI_FORMAT_R8_UNORM):
             return FFX_SURFACE_FORMAT_R8_UNORM;
-        case DXGI_FORMAT_R8_UINT:
+        case(DXGI_FORMAT_R8_UINT):
             return FFX_SURFACE_FORMAT_R8_UINT;
-        //case DXGI_FORMAT_R8_SNORM:
-        //case DXGI_FORMAT_R8_SINT:
-        //case DXGI_FORMAT_R1_UNORM:
-
         case(DXGI_FORMAT_UNKNOWN):
             return FFX_SURFACE_FORMAT_UNKNOWN;
         default:
             FFX_ASSERT_MESSAGE(false, "Format not yet supported");
             return FFX_SURFACE_FORMAT_UNKNOWN;
     }
-}
-
-bool IsDepthDX12(DXGI_FORMAT format)
-{
-    return (format == DXGI_FORMAT_D16_UNORM) || 
-           (format == DXGI_FORMAT_D32_FLOAT) || 
-           (format == DXGI_FORMAT_D24_UNORM_S8_UINT) ||
-           (format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
-}
-
-FfxResourceDescription GetFfxResourceDescriptionDX12(ID3D12Resource* pResource)
-{
-    FfxResourceDescription resourceDescription = {};
-
-    // This is valid
-    if (!pResource)
-        return resourceDescription;
-
-    if (pResource)
-    {
-        D3D12_RESOURCE_DESC desc = pResource->GetDesc();
-        
-        if( desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-        {
-            resourceDescription.flags  = FFX_RESOURCE_FLAGS_NONE;
-            resourceDescription.usage  = FFX_RESOURCE_USAGE_UAV;
-            resourceDescription.width  = (uint32_t)desc.Width;
-            resourceDescription.height = (uint32_t)desc.Height;
-            resourceDescription.format = ffxGetSurfaceFormatDX12(desc.Format);
-
-            // What should we initialize this to?? No case for this yet
-            resourceDescription.depth    = 0;
-            resourceDescription.mipCount = 0;
-
-            // Set the type
-            resourceDescription.type = FFX_RESOURCE_TYPE_BUFFER;
-        }
-        else
-        {
-            // Set flags properly for resource registration
-            resourceDescription.flags = FFX_RESOURCE_FLAGS_NONE;
-            resourceDescription.usage = IsDepthDX12(desc.Format) ? FFX_RESOURCE_USAGE_DEPTHTARGET : FFX_RESOURCE_USAGE_READ_ONLY;
-            if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
-                resourceDescription.usage = (FfxResourceUsage)(resourceDescription.usage | FFX_RESOURCE_USAGE_UAV);
-
-            resourceDescription.width    = (uint32_t)desc.Width;
-            resourceDescription.height   = (uint32_t)desc.Height;
-            resourceDescription.depth    = desc.DepthOrArraySize;
-            resourceDescription.mipCount = desc.MipLevels;
-            resourceDescription.format   = ffxGetSurfaceFormatDX12(desc.Format);
-
-            switch (desc.Dimension)
-            {
-            case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
-                resourceDescription.type = FFX_RESOURCE_TYPE_TEXTURE1D;
-                break;
-            case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
-                if (desc.DepthOrArraySize == 1)
-                    resourceDescription.type = FFX_RESOURCE_TYPE_TEXTURE2D;
-                else if (desc.DepthOrArraySize == 6)
-                    resourceDescription.type = FFX_RESOURCE_TYPE_TEXTURE_CUBE;
-                else
-                    resourceDescription.type = FFX_RESOURCE_TYPE_TEXTURE2D;
-                break;
-            case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
-                resourceDescription.type = FFX_RESOURCE_TYPE_TEXTURE3D;
-                break;
-            default:
-                FFX_ASSERT_MESSAGE(false, "FFXInterface: Cauldron: Unsupported texture dimension requested. Please implement.");
-                break;
-            }
-        }
-    }
-
-    return resourceDescription;
 }
 
 ID3D12Resource* getDX12ResourcePtr(BackendContext_DX12* backendContext, int32_t resourceIndex)
@@ -669,9 +491,10 @@ FfxErrorCode CreateBackendContextDX12(FfxInterface* backendInterface, FfxUInt32*
     BackendContext_DX12* backendContext = (BackendContext_DX12*)backendInterface->scratchBuffer;
 
     // Set things up if this is the first invocation
-    if (!backendContext->refCount) {
+    if (!s_BackendRefCount) {
 
-        new (&backendContext->constantBufferMutex) std::mutex();
+        // Clear everything out
+        memset(backendContext, 0, sizeof(*backendContext));
 
         if (dx12Device != NULL) {
 
@@ -680,9 +503,9 @@ FfxErrorCode CreateBackendContextDX12(FfxInterface* backendInterface, FfxUInt32*
         }
 
         // Map all of our pointers
-        uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
-        uint32_t resourceArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_DX12::Resource), sizeof(uint64_t));
-        uint32_t contextArraySize = FFX_ALIGN_UP(backendContext->maxEffectContexts * sizeof(BackendContext_DX12::EffectContext), sizeof(uint32_t));
+        uint32_t gpuJobDescArraySize = FFX_ALIGN_UP(s_MaxEffectContexts * FFX_MAX_GPU_JOBS * sizeof(FfxGpuJobDescription), sizeof(uint32_t));
+        uint32_t resourceArraySize = FFX_ALIGN_UP(s_MaxEffectContexts * FFX_MAX_RESOURCE_COUNT * sizeof(BackendContext_DX12::Resource), sizeof(uint64_t));
+        uint32_t contextArraySize = FFX_ALIGN_UP(s_MaxEffectContexts * sizeof(BackendContext_DX12::EffectContext), sizeof(uint32_t));
         uint8_t* pMem = (uint8_t*)((BackendContext_DX12*)(backendContext + 1));
 
         // Map gpu job array
@@ -701,7 +524,7 @@ FfxErrorCode CreateBackendContextDX12(FfxInterface* backendInterface, FfxUInt32*
 
         // CPUVisible
         D3D12_DESCRIPTOR_HEAP_DESC descHeap;
-        descHeap.NumDescriptors = FFX_MAX_RESOURCE_COUNT * backendContext->maxEffectContexts;
+        descHeap.NumDescriptors = FFX_MAX_RESOURCE_COUNT * s_MaxEffectContexts;
         descHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         descHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         descHeap.NodeMask = 0;
@@ -714,26 +537,17 @@ FfxErrorCode CreateBackendContextDX12(FfxInterface* backendInterface, FfxUInt32*
         result = dx12Device->CreateDescriptorHeap(&descHeap, IID_PPV_ARGS(&backendContext->descHeapUavGpu));
 
         // descriptor ring buffer
-        descHeap.NumDescriptors = FFX_RING_BUFFER_SIZE * backendContext->maxEffectContexts;
+        descHeap.NumDescriptors = FFX_RING_BUFFER_SIZE * s_MaxEffectContexts;
         backendContext->descRingBufferSize = descHeap.NumDescriptors;
         backendContext->descRingBufferBase = 0;
         result = dx12Device->CreateDescriptorHeap(&descHeap, IID_PPV_ARGS(&backendContext->descRingBuffer));
 
-		// RTV descriptor heap to raster jobs
-		descHeap.NumDescriptors = 8;
-		descHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-		descHeap.NodeMask = 0;
-		descHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-		dx12Device->CreateDescriptorHeap(&descHeap, IID_PPV_ARGS(&backendContext->descHeapRtvCpu));
-
-        std::lock_guard<std::mutex> cbLock{backendContext->constantBufferMutex};
         // create dynamic ring buffer for constant uploads
         backendContext->constantBufferSize = FFX_ALIGN_UP(FFX_MAX_CONST_SIZE, 256) *
-            backendContext->maxEffectContexts * FFX_MAX_PASS_COUNT * FFX_MAX_QUEUED_FRAMES; // Size aligned to 256
+            s_MaxEffectContexts * FFX_MAX_PASS_COUNT * FFX_MAX_QUEUED_FRAMES; // Size aligned to 256
 
         CD3DX12_RESOURCE_DESC constDesc = CD3DX12_RESOURCE_DESC::Buffer(backendContext->constantBufferSize);
-		CD3DX12_HEAP_PROPERTIES heap(D3D12_HEAP_TYPE_UPLOAD);
-        TIF(dx12Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+        TIF(dx12Device->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD), D3D12_HEAP_FLAG_NONE,
             &constDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
             IID_PPV_ARGS(&backendContext->constantBufferResource)));
         backendContext->constantBufferResource->SetName(L"FFX_DX12_DynamicRingBuffer");
@@ -745,10 +559,10 @@ FfxErrorCode CreateBackendContextDX12(FfxInterface* backendInterface, FfxUInt32*
     }
 
     // Increment the ref count
-    ++backendContext->refCount;
+    ++s_BackendRefCount;
 
     // Get an available context id
-    for (uint32_t i = 0; i < backendContext->maxEffectContexts; ++i) {
+    for (size_t i = 0; i < s_MaxEffectContexts; ++i) {
         if (!backendContext->pEffectContexts[i].active) {
             *effectContextId = i;
 
@@ -855,15 +669,14 @@ FfxErrorCode DestroyBackendContextDX12(FfxInterface* backendInterface, FfxUInt32
 {
     FFX_ASSERT(NULL != backendInterface);
     BackendContext_DX12* backendContext = (BackendContext_DX12*)backendInterface->scratchBuffer;
-    FFX_ASSERT(backendContext->refCount > 0);
 
     // Delete any resources allocated by this context
     BackendContext_DX12::EffectContext& effectContext = backendContext->pEffectContexts[effectContextId];
-    for (uint32_t currentStaticResourceIndex = effectContextId * FFX_MAX_RESOURCE_COUNT; currentStaticResourceIndex < (uint32_t)effectContext.nextStaticResource; ++currentStaticResourceIndex) {
+    for (int32_t currentStaticResourceIndex = effectContextId * FFX_MAX_RESOURCE_COUNT; currentStaticResourceIndex < effectContext.nextStaticResource; ++currentStaticResourceIndex) {
         if (backendContext->pResources[currentStaticResourceIndex].resourcePtr) {
             FFX_ASSERT_MESSAGE(false, "FFXInterface: DX12: SDK Resource was not destroyed prior to destroying the backend context. There is a resource leak.");
-            FfxResourceInternal internalResource = { (int32_t)currentStaticResourceIndex };
-            DestroyResourceDX12(backendInterface, internalResource, effectContextId);
+            FfxResourceInternal internalResource = { currentStaticResourceIndex };
+            DestroyResourceDX12(backendInterface, internalResource);
         }
     }
 
@@ -872,21 +685,18 @@ FfxErrorCode DestroyBackendContextDX12(FfxInterface* backendInterface, FfxUInt32
     effectContext.active = false;
 
     // Decrement ref count
-    --backendContext->refCount;
+    --s_BackendRefCount;
 
-    if (!backendContext->refCount) {
+    if (!s_BackendRefCount) {
 
         // release constant buffer pool
         backendContext->constantBufferResource->Unmap(0, nullptr);
         backendContext->constantBufferResource->Release();
-        backendContext->constantBufferMem       = nullptr;
-        backendContext->constantBufferOffset    = 0;
-        backendContext->constantBufferSize      = 0;
-        backendContext->gpuJobCount             = 0;
-        backendContext->barrierCount            = 0;
+        backendContext->constantBufferMem = nullptr;
+        backendContext->constantBufferOffset = 0;
+        backendContext->constantBufferSize = 0;
 
         // release heaps
-		backendContext->descHeapRtvCpu->Release();
         backendContext->descHeapSrvCpu->Release();
         backendContext->descHeapUavCpu->Release();
         backendContext->descHeapUavGpu->Release();
@@ -1013,7 +823,7 @@ FfxErrorCode CreateResourceDX12(
         uint8_t* dst = static_cast<uint8_t*>(uploadBufferData);
         for (uint32_t currentRowIndex = 0; currentRowIndex < createResourceDescription->resourceDescription.height; ++currentRowIndex) {
 
-            memcpy(dst, src, (size_t)rowSizeInBytes);
+            memcpy(dst, src, rowSizeInBytes);
             src += rowSizeInBytes;
             dst += dx12Footprint.Footprint.RowPitch;
         }
@@ -1225,73 +1035,19 @@ FfxErrorCode CreateResourceDX12(
 
 FfxErrorCode DestroyResourceDX12(
     FfxInterface* backendInterface,
-    FfxResourceInternal resource,
-	FfxUInt32 effectContextId)
+    FfxResourceInternal resource)
 {
     FFX_ASSERT(NULL != backendInterface);
 
     BackendContext_DX12* backendContext = (BackendContext_DX12*)backendInterface->scratchBuffer;
-	BackendContext_DX12::EffectContext& effectContext = backendContext->pEffectContexts[effectContextId];
-	if ((resource.internalIndex >= int32_t(effectContextId * FFX_MAX_RESOURCE_COUNT)) && (resource.internalIndex < int32_t(effectContext.nextStaticResource))) {
-		ID3D12Resource* dx12Resource = getDX12ResourcePtr(backendContext, resource.internalIndex);
+    ID3D12Resource* dx12Resource = getDX12ResourcePtr(backendContext, resource.internalIndex);
 
-		if (dx12Resource) {
-			dx12Resource->Release();
-			backendContext->pResources[resource.internalIndex].resourcePtr = nullptr;
-		}
-        
-        return FFX_OK;
-	}
-
-	return FFX_ERROR_OUT_OF_RANGE;
-}
-
-DXGI_FORMAT patchDxgiFormatWithFfxUsage(DXGI_FORMAT dxResFmt, FfxSurfaceFormat ffxFmt)
-{
-    DXGI_FORMAT fromFfx = ffxGetDX12FormatFromSurfaceFormat(ffxFmt);
-    DXGI_FORMAT fmt = dxResFmt;
-
-    switch (fmt)
-    {
-    // fixup typeless formats with what is passed in the ffxSurfaceFormat
-    case DXGI_FORMAT_UNKNOWN:
-    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-    case DXGI_FORMAT_R32G32B32_TYPELESS:
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-    case DXGI_FORMAT_R32G32_TYPELESS:
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-    case DXGI_FORMAT_R16G16_TYPELESS:
-    case DXGI_FORMAT_R32_TYPELESS:
-    case DXGI_FORMAT_R8G8_TYPELESS:
-    case DXGI_FORMAT_R16_TYPELESS:
-    case DXGI_FORMAT_R8_TYPELESS:
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        return fromFfx;
-
-    // fixup RGBA8 with SRGB flag passed in the ffxSurfaceFormat
-    case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-        return fromFfx;
-    
-    // fixup depth formats as ffxGetDX12FormatFromSurfaceFormat will result in wrong format
-    case DXGI_FORMAT_D32_FLOAT:
-        return DXGI_FORMAT_R32_FLOAT;
-
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-
-    case DXGI_FORMAT_R24G8_TYPELESS:
-    case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-
-    case DXGI_FORMAT_D16_UNORM:
-        return DXGI_FORMAT_R16_UNORM;
-
-    default:
-        break;
+    if (dx12Resource) {
+        dx12Resource->Release();
+        backendContext->pResources[resource.internalIndex].resourcePtr = nullptr;
     }
-    return fmt;
+
+    return FFX_OK;
 }
 
 FfxErrorCode RegisterResourceDX12(
@@ -1337,14 +1093,10 @@ FfxErrorCode RegisterResourceDX12(
         D3D12_UNORDERED_ACCESS_VIEW_DESC dx12UavDescription = {};
         D3D12_SHADER_RESOURCE_VIEW_DESC dx12SrvDescription = {};
         D3D12_RESOURCE_DESC dx12Desc = dx12Resource->GetDesc();
-
-        // we still want to respect the format provided in the description for SRGB or TYPELESS resources
-        DXGI_FORMAT descFormat = patchDxgiFormatWithFfxUsage(dx12Desc.Format, inFfxResource->description.format);
-
-        dx12UavDescription.Format = convertFormatUav(descFormat);
+        dx12UavDescription.Format = convertFormatUav(dx12Desc.Format);
         // Will support something other than this only where there is an actual need for it
         dx12SrvDescription.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        dx12SrvDescription.Format = convertFormatSrv(descFormat);
+        dx12SrvDescription.Format = convertFormatSrv(dx12Desc.Format);
 
         bool requestArrayView = FFX_CONTAINS_FLAG(inFfxResource->description.usage, FFX_RESOURCE_USAGE_ARRAYVIEW);
 
@@ -1455,7 +1207,6 @@ FfxErrorCode RegisterResourceDX12(
                 backendResource->uavDescCount = 1;
                 backendResource->uavDescIndex = effectContext.nextDynamicUavDescriptor--;
 
-                dx12UavDescription.Format = DXGI_FORMAT_UNKNOWN;
                 dx12UavDescription.Buffer.FirstElement = 0;
                 dx12UavDescription.Buffer.StructureByteStride = backendResource->resourceDescription.stride;
                 dx12UavDescription.Buffer.NumElements = backendResource->resourceDescription.size / backendResource->resourceDescription.stride;
@@ -1475,7 +1226,7 @@ FfxErrorCode RegisterResourceDX12(
                 dx12SrvDescription.Buffer.StructureByteStride = backendResource->resourceDescription.stride;
                 dx12SrvDescription.Buffer.NumElements         = backendResource->resourceDescription.size / backendResource->resourceDescription.stride;
                 D3D12_CPU_DESCRIPTOR_HANDLE dx12CpuHandle     = backendContext->descHeapSrvCpu->GetCPUDescriptorHandleForHeapStart();
-                dx12CpuHandle.ptr += outFfxResourceInternal->internalIndex * dx12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                dx12CpuHandle.ptr = outFfxResourceInternal->internalIndex * dx12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
                 dx12Device->CreateShaderResourceView(dx12Resource, &dx12SrvDescription, dx12CpuHandle);
                 backendResource->srvDescIndex = outFfxResourceInternal->internalIndex;
             }
@@ -1632,603 +1383,251 @@ FfxErrorCode CreatePipelineDX12(
     BackendContext_DX12* backendContext = (BackendContext_DX12*)backendInterface->scratchBuffer;
     ID3D12Device* dx12Device = backendContext->device;
 
-    if (pipelineDescription->stage == FfxBindStage(FFX_BIND_VERTEX_SHADER_STAGE | FFX_BIND_PIXEL_SHADER_STAGE))
+    FfxShaderBlob shaderBlob = { };
+    ffxGetPermutationBlobByIndex(effect, pass, permutationOptions, &shaderBlob);
+    FFX_ASSERT(shaderBlob.data && shaderBlob.size);
+
+    // set up root signature
+    // easiest implementation: simply create one root signature per pipeline
+    // should add some management later on to avoid unnecessarily re-binding the root signature
     {
-        // create rasterPipeline
-        FfxShaderBlob shaderBlobVS = {};
-        backendInterface->fpGetPermutationBlobByIndex(effect, pass, FFX_BIND_VERTEX_SHADER_STAGE, permutationOptions, &shaderBlobVS);
-        FFX_ASSERT(shaderBlobVS.data && shaderBlobVS.size);
+        FFX_ASSERT(pipelineDescription->samplerCount <= FFX_MAX_SAMPLERS);
+        const size_t samplerCount = pipelineDescription->samplerCount;
+        D3D12_STATIC_SAMPLER_DESC dx12SamplerDescriptions[FFX_MAX_SAMPLERS];
+        for (uint32_t currentSamplerIndex = 0; currentSamplerIndex < samplerCount; ++currentSamplerIndex) {
 
-        FfxShaderBlob shaderBlobPS = {};
-        backendInterface->fpGetPermutationBlobByIndex(effect, pass, FFX_BIND_PIXEL_SHADER_STAGE, permutationOptions, &shaderBlobPS);
-        FFX_ASSERT(shaderBlobPS.data && shaderBlobPS.size); 
+            D3D12_STATIC_SAMPLER_DESC dx12SamplerDesc = {};
 
-        {
-            // set up root signature
-            // easiest implementation: simply create one root signature per pipeline
-            // should add some management later on to avoid unnecessarily re-binding the root signature
+            dx12SamplerDesc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+            dx12SamplerDesc.MinLOD = 0.f;
+            dx12SamplerDesc.MaxLOD = D3D12_FLOAT32_MAX;
+            dx12SamplerDesc.MipLODBias = 0.f;
+            dx12SamplerDesc.MaxAnisotropy = 16;
+            dx12SamplerDesc.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+            dx12SamplerDesc.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            dx12SamplerDesc.AddressU = FfxGetAddressModeDX12(pipelineDescription->samplers[currentSamplerIndex].addressModeU);
+            dx12SamplerDesc.AddressV = FfxGetAddressModeDX12(pipelineDescription->samplers[currentSamplerIndex].addressModeV);
+            dx12SamplerDesc.AddressW = FfxGetAddressModeDX12(pipelineDescription->samplers[currentSamplerIndex].addressModeW);
+
+            switch (pipelineDescription->samplers[currentSamplerIndex].filter)
             {
-                FFX_ASSERT(pipelineDescription->samplerCount <= FFX_MAX_SAMPLERS);
-                const size_t              samplerCount = pipelineDescription->samplerCount;
-                D3D12_STATIC_SAMPLER_DESC dx12SamplerDescriptions[FFX_MAX_SAMPLERS];
-                for (uint32_t currentSamplerIndex = 0; currentSamplerIndex < samplerCount; ++currentSamplerIndex)
-                {
-                    D3D12_STATIC_SAMPLER_DESC dx12SamplerDesc = {};
+            case FFX_FILTER_TYPE_MINMAGMIP_POINT:
+                dx12SamplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+                break;
+            case FFX_FILTER_TYPE_MINMAGMIP_LINEAR:
+                dx12SamplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+                break;
+            case FFX_FILTER_TYPE_MINMAGLINEARMIP_POINT:
+                dx12SamplerDesc.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+                break;
 
-                    dx12SamplerDesc.ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
-                    dx12SamplerDesc.MinLOD           = 0.f;
-                    dx12SamplerDesc.MaxLOD           = D3D12_FLOAT32_MAX;
-                    dx12SamplerDesc.MipLODBias       = 0.f;
-                    dx12SamplerDesc.MaxAnisotropy    = 16;
-                    dx12SamplerDesc.BorderColor      = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-                    dx12SamplerDesc.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-                    dx12SamplerDesc.AddressU         = FfxGetAddressModeDX12(pipelineDescription->samplers[currentSamplerIndex].addressModeU);
-                    dx12SamplerDesc.AddressV         = FfxGetAddressModeDX12(pipelineDescription->samplers[currentSamplerIndex].addressModeV);
-                    dx12SamplerDesc.AddressW         = FfxGetAddressModeDX12(pipelineDescription->samplers[currentSamplerIndex].addressModeW);
-
-                    switch (pipelineDescription->samplers[currentSamplerIndex].filter)
-                    {
-                    case FFX_FILTER_TYPE_MINMAGMIP_POINT:
-                        dx12SamplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-                        break;
-                    case FFX_FILTER_TYPE_MINMAGMIP_LINEAR:
-                        dx12SamplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-                        break;
-                    case FFX_FILTER_TYPE_MINMAGLINEARMIP_POINT:
-                        dx12SamplerDesc.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-                        break;
-
-                    default:
-                        FFX_ASSERT_MESSAGE(false, "Unsupported filter type requested. Please implement");
-                        break;
-                    }
-
-                    dx12SamplerDescriptions[currentSamplerIndex]                = dx12SamplerDesc;
-                    dx12SamplerDescriptions[currentSamplerIndex].ShaderRegister = (UINT)currentSamplerIndex;
-                }
-
-                // storage for maximum number of descriptor ranges.
-                const int32_t          maximumDescriptorRangeSize             = 2;
-                D3D12_DESCRIPTOR_RANGE dx12Ranges[maximumDescriptorRangeSize] = {};
-                int32_t                currentDescriptorRangeIndex            = 0;
-
-                // storage for maximum number of root parameters.
-                const int32_t        maximumRootParameters                     = 10;
-                D3D12_ROOT_PARAMETER dx12RootParameters[maximumRootParameters] = {};
-                int32_t              currentRootParameterIndex                 = 0;
-
-                // Allocate a max of binding slots
-                int32_t uavCount = shaderBlobVS.uavBufferCount || shaderBlobVS.uavTextureCount || shaderBlobVS.uavBufferCount || shaderBlobVS.uavTextureCount
-                                       ? FFX_MAX_RESOURCE_IDENTIFIER_COUNT
-                                       : 0;
-                int32_t srvCount = shaderBlobVS.srvBufferCount || shaderBlobVS.srvTextureCount || shaderBlobPS.srvBufferCount || shaderBlobPS.srvTextureCount
-                                       ? FFX_MAX_RESOURCE_IDENTIFIER_COUNT
-                                       : 0;
-                if (uavCount > 0)
-                {
-                    FFX_ASSERT(currentDescriptorRangeIndex < maximumDescriptorRangeSize);
-                    D3D12_DESCRIPTOR_RANGE* dx12DescriptorRange = &dx12Ranges[currentDescriptorRangeIndex];
-                    memset(dx12DescriptorRange, 0, sizeof(D3D12_DESCRIPTOR_RANGE));
-                    dx12DescriptorRange->OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-                    dx12DescriptorRange->RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-                    dx12DescriptorRange->BaseShaderRegister                = 0;
-                    dx12DescriptorRange->NumDescriptors                    = uavCount;
-                    currentDescriptorRangeIndex++;
-
-                    FFX_ASSERT(currentRootParameterIndex < maximumRootParameters);
-                    D3D12_ROOT_PARAMETER* dx12RootParameterSlot = &dx12RootParameters[currentRootParameterIndex];
-                    memset(dx12RootParameterSlot, 0, sizeof(D3D12_ROOT_PARAMETER));
-                    dx12RootParameterSlot->ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-                    dx12RootParameterSlot->DescriptorTable.NumDescriptorRanges = 1;
-                    currentRootParameterIndex++;
-                }
-
-                if (srvCount > 0)
-                {
-                    FFX_ASSERT(currentDescriptorRangeIndex < maximumDescriptorRangeSize);
-                    D3D12_DESCRIPTOR_RANGE* dx12DescriptorRange = &dx12Ranges[currentDescriptorRangeIndex];
-                    memset(dx12DescriptorRange, 0, sizeof(D3D12_DESCRIPTOR_RANGE));
-                    dx12DescriptorRange->OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-                    dx12DescriptorRange->RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-                    dx12DescriptorRange->BaseShaderRegister                = 0;
-                    dx12DescriptorRange->NumDescriptors                    = srvCount;
-                    currentDescriptorRangeIndex++;
-
-                    FFX_ASSERT(currentRootParameterIndex < maximumRootParameters);
-                    D3D12_ROOT_PARAMETER* dx12RootParameterSlot = &dx12RootParameters[currentRootParameterIndex];
-                    memset(dx12RootParameterSlot, 0, sizeof(D3D12_ROOT_PARAMETER));
-                    dx12RootParameterSlot->ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-                    dx12RootParameterSlot->DescriptorTable.NumDescriptorRanges = 1;
-                    currentRootParameterIndex++;
-                }
-
-                // Setup the descriptor table bindings for the above
-                for (int32_t currentRangeIndex = 0; currentRangeIndex < currentDescriptorRangeIndex; currentRangeIndex++)
-                {
-                    dx12RootParameters[currentRangeIndex].DescriptorTable.pDescriptorRanges = &dx12Ranges[currentRangeIndex];
-                }
-
-                // Setup root constants as push constants for dx12
-                FFX_ASSERT(pipelineDescription->rootConstantBufferCount <= FFX_MAX_NUM_CONST_BUFFERS);
-                size_t   rootConstantsSize = pipelineDescription->rootConstantBufferCount;
-                uint32_t rootConstants[FFX_MAX_NUM_CONST_BUFFERS];
-
-                for (uint32_t currentRootConstantIndex = 0; currentRootConstantIndex < pipelineDescription->rootConstantBufferCount; ++currentRootConstantIndex)
-                {
-                    rootConstants[currentRootConstantIndex] = pipelineDescription->rootConstants[currentRootConstantIndex].size;
-                }
-
-                for (int32_t currentRootConstantIndex = 0; currentRootConstantIndex < (int32_t)pipelineDescription->rootConstantBufferCount;
-                     currentRootConstantIndex++)
-                {
-                    FFX_ASSERT(currentRootParameterIndex < maximumRootParameters);
-                    D3D12_ROOT_PARAMETER* rootParameterSlot = &dx12RootParameters[currentRootParameterIndex];
-                    memset(rootParameterSlot, 0, sizeof(D3D12_ROOT_PARAMETER));
-                    rootParameterSlot->ParameterType            = D3D12_ROOT_PARAMETER_TYPE_CBV;
-                    rootParameterSlot->Constants.ShaderRegister = currentRootConstantIndex;
-                    currentRootParameterIndex++;
-                }
-
-                D3D12_ROOT_SIGNATURE_DESC dx12RootSignatureDescription = {};
-                dx12RootSignatureDescription.NumParameters             = currentRootParameterIndex;
-                dx12RootSignatureDescription.pParameters               = dx12RootParameters;
-                dx12RootSignatureDescription.NumStaticSamplers         = (UINT)samplerCount;
-                dx12RootSignatureDescription.pStaticSamplers           = dx12SamplerDescriptions;
-
-                ID3DBlob* outBlob   = nullptr;
-                ID3DBlob* errorBlob = nullptr;
-
-                //Query D3D12SerializeRootSignature from d3d12.dll handle
-                typedef HRESULT(__stdcall * D3D12SerializeRootSignatureType)(
-                    const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
-
-                //Do not pass hD3D12 handle to the FreeLibrary function, as GetModuleHandle will not increment refcount
-                HMODULE d3d12ModuleHandle = GetModuleHandleW(L"D3D12.dll");
-
-                if (NULL != d3d12ModuleHandle)
-                {
-                    D3D12SerializeRootSignatureType dx12SerializeRootSignatureType =
-                        (D3D12SerializeRootSignatureType)GetProcAddress(d3d12ModuleHandle, "D3D12SerializeRootSignature");
-
-                    if (nullptr != dx12SerializeRootSignatureType)
-                    {
-                        HRESULT result = dx12SerializeRootSignatureType(&dx12RootSignatureDescription, D3D_ROOT_SIGNATURE_VERSION_1, &outBlob, &errorBlob);
-                        if (FAILED(result))
-                        {
-                            return FFX_ERROR_BACKEND_API_ERROR;
-                        }
-
-                        size_t   blobSize = outBlob->GetBufferSize();
-                        int64_t* blobData = (int64_t*)outBlob->GetBufferPointer();
-
-                        result = dx12Device->CreateRootSignature(0,
-                                                                 outBlob->GetBufferPointer(),
-                                                                 outBlob->GetBufferSize(),
-                                                                 IID_PPV_ARGS(reinterpret_cast<ID3D12RootSignature**>(&outPipeline->rootSignature)));
-                        if (FAILED(result))
-                        {
-                            return FFX_ERROR_BACKEND_API_ERROR;
-                        }
-                    }
-                    else
-                    {
-                        return FFX_ERROR_BACKEND_API_ERROR;
-                    }
-                }
-                else
-                {
-                    return FFX_ERROR_BACKEND_API_ERROR;
-                }
+            default:
+                FFX_ASSERT_MESSAGE(false, "Unsupported filter type requested. Please implement");
+                break;
             }
 
-            ID3D12RootSignature* dx12RootSignature = reinterpret_cast<ID3D12RootSignature*>(outPipeline->rootSignature);
-
-            // Only set the command signature if this is setup as an indirect workload
-            if (pipelineDescription->indirectWorkload)
-            {
-                D3D12_INDIRECT_ARGUMENT_DESC argumentDescs        = {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
-                D3D12_COMMAND_SIGNATURE_DESC commandSignatureDesc = {};
-                commandSignatureDesc.pArgumentDescs               = &argumentDescs;
-                commandSignatureDesc.NumArgumentDescs             = 1;
-                commandSignatureDesc.ByteStride                   = sizeof(D3D12_DISPATCH_ARGUMENTS);
-
-                HRESULT result = dx12Device->CreateCommandSignature(
-                    &commandSignatureDesc, nullptr, IID_PPV_ARGS(reinterpret_cast<ID3D12CommandSignature**>(&outPipeline->cmdSignature)));
-                if (FAILED(result))
-                {
-                    return FFX_ERROR_BACKEND_API_ERROR;
-                }
-            }
-            else
-            {
-                outPipeline->cmdSignature = nullptr;
-            }
-
-            FFX_ASSERT(shaderBlobVS.srvTextureCount + shaderBlobVS.srvBufferCount + shaderBlobPS.srvTextureCount + shaderBlobPS.srvBufferCount <=
-                       FFX_MAX_NUM_SRVS);
-            FFX_ASSERT(shaderBlobVS.uavTextureCount + shaderBlobVS.uavBufferCount + shaderBlobPS.uavTextureCount + shaderBlobPS.uavBufferCount <=
-                       FFX_MAX_NUM_UAVS);
-            FFX_ASSERT(shaderBlobVS.cbvCount + shaderBlobPS.cbvCount <= FFX_MAX_NUM_CONST_BUFFERS);
-
-            // populate the pass.
-            outPipeline->srvTextureCount = shaderBlobVS.srvTextureCount + shaderBlobPS.srvTextureCount;
-            outPipeline->uavTextureCount = shaderBlobVS.uavTextureCount + shaderBlobPS.uavTextureCount;
-            outPipeline->srvBufferCount  = shaderBlobVS.srvBufferCount + shaderBlobPS.srvBufferCount;
-            outPipeline->uavBufferCount  = shaderBlobVS.uavBufferCount + shaderBlobPS.uavBufferCount;
-            outPipeline->constCount      = shaderBlobVS.cbvCount + shaderBlobPS.cbvCount;
-
-            // Todo when needed
-            //outPipeline->samplerCount      = shaderBlob.samplerCount;
-            //outPipeline->rtAccelStructCount= shaderBlob.rtAccelStructCount;
-
-            std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-            uint32_t                                               srvIndex = 0;
-            for (uint32_t vsSrvIndex = 0; vsSrvIndex < shaderBlobVS.srvTextureCount; ++vsSrvIndex)
-            {
-                outPipeline->srvTextureBindings[srvIndex].slotIndex = shaderBlobVS.boundSRVTextures[vsSrvIndex];
-                outPipeline->srvTextureBindings[srvIndex].bindCount = shaderBlobVS.boundSRVTextureCounts[vsSrvIndex];
-                wcscpy_s(outPipeline->srvTextureBindings[srvIndex].name, converter.from_bytes(shaderBlobVS.boundSRVTextureNames[vsSrvIndex]).c_str());
-                ++srvIndex;
-            }
-            for (uint32_t psSrvIndex = 0; psSrvIndex < shaderBlobPS.srvTextureCount; ++psSrvIndex)
-            {
-                outPipeline->srvTextureBindings[srvIndex].slotIndex = shaderBlobPS.boundSRVTextures[psSrvIndex];
-                outPipeline->srvTextureBindings[srvIndex].bindCount = shaderBlobPS.boundSRVTextureCounts[psSrvIndex];
-                wcscpy_s(outPipeline->srvTextureBindings[srvIndex].name, converter.from_bytes(shaderBlobPS.boundSRVTextureNames[psSrvIndex]).c_str());
-                ++srvIndex;
-            }
-
-            uint32_t uavIndex = 0;
-            for (uint32_t vsUavIndex = 0; vsUavIndex < shaderBlobVS.uavTextureCount; ++vsUavIndex)
-            {
-                outPipeline->uavTextureBindings[uavIndex].slotIndex = shaderBlobVS.boundUAVTextures[vsUavIndex];
-                outPipeline->uavTextureBindings[uavIndex].bindCount = shaderBlobVS.boundUAVTextureCounts[vsUavIndex];
-                wcscpy_s(outPipeline->uavTextureBindings[uavIndex].name, converter.from_bytes(shaderBlobVS.boundUAVTextureNames[vsUavIndex]).c_str());
-                ++uavIndex;
-            }
-            for (uint32_t psUavIndex = 0; psUavIndex < shaderBlobPS.uavTextureCount; ++psUavIndex)
-            {
-                outPipeline->uavTextureBindings[uavIndex].slotIndex = shaderBlobPS.boundUAVTextures[psUavIndex];
-                outPipeline->uavTextureBindings[uavIndex].bindCount = shaderBlobPS.boundUAVTextureCounts[psUavIndex];
-                wcscpy_s(outPipeline->uavTextureBindings[uavIndex].name, converter.from_bytes(shaderBlobPS.boundUAVTextureNames[psUavIndex]).c_str());
-                ++uavIndex;
-            }
-
-            uint32_t srvBufferIndex = 0;
-            for (uint32_t vsSrvIndex = 0; vsSrvIndex < shaderBlobVS.srvBufferCount; ++vsSrvIndex)
-            {
-                outPipeline->srvBufferBindings[srvBufferIndex].slotIndex = shaderBlobVS.boundSRVBuffers[vsSrvIndex];
-                outPipeline->srvBufferBindings[srvBufferIndex].bindCount = shaderBlobVS.boundSRVBufferCounts[vsSrvIndex];
-                wcscpy_s(outPipeline->srvBufferBindings[srvBufferIndex].name, converter.from_bytes(shaderBlobVS.boundSRVBufferNames[vsSrvIndex]).c_str());
-                ++srvBufferIndex;
-            }
-            for (uint32_t psSrvIndex = 0; psSrvIndex < shaderBlobPS.srvBufferCount; ++psSrvIndex)
-            {
-                outPipeline->srvBufferBindings[srvBufferIndex].slotIndex = shaderBlobPS.boundSRVBuffers[psSrvIndex];
-                outPipeline->srvBufferBindings[srvBufferIndex].bindCount = shaderBlobPS.boundSRVBufferCounts[psSrvIndex];
-                wcscpy_s(outPipeline->srvBufferBindings[srvBufferIndex].name, converter.from_bytes(shaderBlobPS.boundSRVBufferNames[psSrvIndex]).c_str());
-                ++srvBufferIndex;
-            }
-
-            uint32_t uavBufferIndex = 0;
-            for (uint32_t vsUavIndex = 0; vsUavIndex < shaderBlobVS.uavBufferCount; ++vsUavIndex)
-            {
-                outPipeline->uavBufferBindings[uavBufferIndex].slotIndex = shaderBlobVS.boundUAVBuffers[vsUavIndex];
-                outPipeline->uavBufferBindings[uavBufferIndex].bindCount = shaderBlobVS.boundUAVBufferCounts[vsUavIndex];
-                wcscpy_s(outPipeline->uavBufferBindings[uavBufferIndex].name, converter.from_bytes(shaderBlobVS.boundUAVBufferNames[vsUavIndex]).c_str());
-                ++uavBufferIndex;
-            }
-            for (uint32_t psUavIndex = 0; psUavIndex < shaderBlobPS.uavBufferCount; ++psUavIndex)
-            {
-                outPipeline->uavBufferBindings[uavBufferIndex].slotIndex = shaderBlobPS.boundUAVBuffers[psUavIndex];
-                outPipeline->uavBufferBindings[uavBufferIndex].bindCount = shaderBlobPS.boundUAVBufferCounts[psUavIndex];
-                wcscpy_s(outPipeline->uavBufferBindings[uavBufferIndex].name, converter.from_bytes(shaderBlobPS.boundUAVBufferNames[psUavIndex]).c_str());
-                ++uavBufferIndex;
-            }
-
-            uint32_t cbIndex = 0;
-            for (uint32_t vsCbIndex = 0; vsCbIndex < shaderBlobVS.cbvCount; ++vsCbIndex)
-            {
-                outPipeline->constantBufferBindings[cbIndex].slotIndex = shaderBlobVS.boundConstantBuffers[vsCbIndex];
-                outPipeline->constantBufferBindings[cbIndex].bindCount = shaderBlobVS.boundConstantBufferCounts[vsCbIndex];
-                wcscpy_s(outPipeline->constantBufferBindings[cbIndex].name, converter.from_bytes(shaderBlobVS.boundConstantBufferNames[vsCbIndex]).c_str());
-                ++cbIndex;
-            }
-            for (uint32_t psCbIndex = 0; psCbIndex < shaderBlobPS.cbvCount; ++psCbIndex)
-            {
-                outPipeline->constantBufferBindings[cbIndex].slotIndex = shaderBlobPS.boundConstantBuffers[psCbIndex];
-                outPipeline->constantBufferBindings[cbIndex].bindCount = shaderBlobPS.boundConstantBufferCounts[psCbIndex];
-                wcscpy_s(outPipeline->constantBufferBindings[cbIndex].name, converter.from_bytes(shaderBlobPS.boundConstantBufferNames[psCbIndex]).c_str());
-                ++cbIndex;
-            }
+            dx12SamplerDescriptions[currentSamplerIndex] = dx12SamplerDesc;
+            dx12SamplerDescriptions[currentSamplerIndex].ShaderRegister = (UINT)currentSamplerIndex;
         }
 
-        ID3D12RootSignature* dx12RootSignature = reinterpret_cast<ID3D12RootSignature*>(outPipeline->rootSignature);
+        // storage for maximum number of descriptor ranges.
+        const int32_t maximumDescriptorRangeSize = 2;
+        D3D12_DESCRIPTOR_RANGE dx12Ranges[maximumDescriptorRangeSize] = {};
+        int32_t currentDescriptorRangeIndex = 0;
 
-        FfxSurfaceFormat ffxBackbufferFmt = pipelineDescription->backbufferFormat;
+        // storage for maximum number of root parameters.
+        const int32_t maximumRootParameters = 10;
+        D3D12_ROOT_PARAMETER dx12RootParameters[maximumRootParameters] = {};
+        int32_t currentRootParameterIndex = 0;
 
-        // create the PSO
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC dx12PipelineStateDescription = {};
-        dx12PipelineStateDescription.RasterizerState                    = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-        dx12PipelineStateDescription.BlendState                         = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-        dx12PipelineStateDescription.DepthStencilState                  = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
-        dx12PipelineStateDescription.DepthStencilState.DepthEnable      = FALSE;
-        dx12PipelineStateDescription.SampleMask                         = UINT_MAX;
-        dx12PipelineStateDescription.PrimitiveTopologyType              = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        dx12PipelineStateDescription.SampleDesc                         = {1, 0};
-        dx12PipelineStateDescription.NumRenderTargets                   = 1;
-        dx12PipelineStateDescription.RTVFormats[0]                      = ffxGetDX12FormatFromSurfaceFormat(ffxBackbufferFmt);
+        // Allocate a max of binding slots
+        int32_t uavCount = shaderBlob.uavBufferCount || shaderBlob.uavTextureCount ? FFX_MAX_RESOURCE_IDENTIFIER_COUNT : 0;
+        int32_t srvCount = shaderBlob.srvBufferCount || shaderBlob.srvTextureCount ? FFX_MAX_RESOURCE_IDENTIFIER_COUNT : 0;
+        if (uavCount > 0) {
 
-        dx12PipelineStateDescription.Flags              = D3D12_PIPELINE_STATE_FLAG_NONE;
-        dx12PipelineStateDescription.pRootSignature     = dx12RootSignature;
-        dx12PipelineStateDescription.VS.pShaderBytecode = shaderBlobVS.data;
-        dx12PipelineStateDescription.VS.BytecodeLength  = shaderBlobVS.size;
-        dx12PipelineStateDescription.PS.pShaderBytecode = shaderBlobPS.data;
-        dx12PipelineStateDescription.PS.BytecodeLength  = shaderBlobPS.size;
+            FFX_ASSERT(currentDescriptorRangeIndex < maximumDescriptorRangeSize);
+            D3D12_DESCRIPTOR_RANGE* dx12DescriptorRange = &dx12Ranges[currentDescriptorRangeIndex];
+            memset(dx12DescriptorRange, 0, sizeof(D3D12_DESCRIPTOR_RANGE));
+            dx12DescriptorRange->OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+            dx12DescriptorRange->RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            dx12DescriptorRange->BaseShaderRegister = 0;
+            dx12DescriptorRange->NumDescriptors = uavCount;
+            currentDescriptorRangeIndex++;
 
-        if (FAILED(dx12Device->CreateGraphicsPipelineState(&dx12PipelineStateDescription,
-                                                           IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&outPipeline->pipeline)))))
+            FFX_ASSERT(currentRootParameterIndex < maximumRootParameters);
+            D3D12_ROOT_PARAMETER* dx12RootParameterSlot = &dx12RootParameters[currentRootParameterIndex];
+            memset(dx12RootParameterSlot, 0, sizeof(D3D12_ROOT_PARAMETER));
+            dx12RootParameterSlot->ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            dx12RootParameterSlot->DescriptorTable.NumDescriptorRanges = 1;
+            currentRootParameterIndex++;
+        }
+
+        if (srvCount > 0) {
+
+            FFX_ASSERT(currentDescriptorRangeIndex < maximumDescriptorRangeSize);
+            D3D12_DESCRIPTOR_RANGE* dx12DescriptorRange = &dx12Ranges[currentDescriptorRangeIndex];
+            memset(dx12DescriptorRange, 0, sizeof(D3D12_DESCRIPTOR_RANGE));
+            dx12DescriptorRange->OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+            dx12DescriptorRange->RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            dx12DescriptorRange->BaseShaderRegister = 0;
+            dx12DescriptorRange->NumDescriptors = srvCount;
+            currentDescriptorRangeIndex++;
+
+            FFX_ASSERT(currentRootParameterIndex < maximumRootParameters);
+            D3D12_ROOT_PARAMETER* dx12RootParameterSlot = &dx12RootParameters[currentRootParameterIndex];
+            memset(dx12RootParameterSlot, 0, sizeof(D3D12_ROOT_PARAMETER));
+            dx12RootParameterSlot->ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            dx12RootParameterSlot->DescriptorTable.NumDescriptorRanges = 1;
+            currentRootParameterIndex++;
+        }
+
+        // Setup the descriptor table bindings for the above
+        for (int32_t currentRangeIndex = 0; currentRangeIndex < currentDescriptorRangeIndex; currentRangeIndex++) {
+
+            dx12RootParameters[currentRangeIndex].DescriptorTable.pDescriptorRanges = &dx12Ranges[currentRangeIndex];
+        }
+
+        // Setup root constants as push constants for dx12
+        FFX_ASSERT(pipelineDescription->rootConstantBufferCount <= FFX_MAX_NUM_CONST_BUFFERS);
+        size_t rootConstantsSize = pipelineDescription->rootConstantBufferCount;
+        uint32_t rootConstants[FFX_MAX_NUM_CONST_BUFFERS];
+
+        for (uint32_t currentRootConstantIndex = 0; currentRootConstantIndex < pipelineDescription->rootConstantBufferCount; ++currentRootConstantIndex) {
+
+            rootConstants[currentRootConstantIndex] = pipelineDescription->rootConstants[currentRootConstantIndex].size;
+        }
+
+        for (int32_t currentRootConstantIndex = 0; currentRootConstantIndex < (int32_t)pipelineDescription->rootConstantBufferCount; currentRootConstantIndex++) {
+
+            FFX_ASSERT(currentRootParameterIndex < maximumRootParameters);
+            D3D12_ROOT_PARAMETER* rootParameterSlot = &dx12RootParameters[currentRootParameterIndex];
+            memset(rootParameterSlot, 0, sizeof(D3D12_ROOT_PARAMETER));
+            rootParameterSlot->ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            rootParameterSlot->Constants.ShaderRegister = currentRootConstantIndex;
+            currentRootParameterIndex++;
+        }
+
+        D3D12_ROOT_SIGNATURE_DESC dx12RootSignatureDescription = {};
+        dx12RootSignatureDescription.NumParameters = currentRootParameterIndex;
+        dx12RootSignatureDescription.pParameters = dx12RootParameters;
+        dx12RootSignatureDescription.NumStaticSamplers = (UINT)samplerCount;
+        dx12RootSignatureDescription.pStaticSamplers = dx12SamplerDescriptions;
+
+        ID3DBlob* outBlob = nullptr;
+        ID3DBlob* errorBlob = nullptr;
+
+        //Query D3D12SerializeRootSignature from d3d12.dll handle
+        typedef HRESULT(__stdcall* D3D12SerializeRootSignatureType)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
+
+        //Do not pass hD3D12 handle to the FreeLibrary function, as GetModuleHandle will not increment refcount
+        HMODULE d3d12ModuleHandle = GetModuleHandleW(L"D3D12.dll");
+
+        if (NULL != d3d12ModuleHandle) {
+
+            D3D12SerializeRootSignatureType dx12SerializeRootSignatureType = (D3D12SerializeRootSignatureType)GetProcAddress(d3d12ModuleHandle, "D3D12SerializeRootSignature");
+
+            if (nullptr != dx12SerializeRootSignatureType) {
+
+                HRESULT result = dx12SerializeRootSignatureType(&dx12RootSignatureDescription, D3D_ROOT_SIGNATURE_VERSION_1, &outBlob, &errorBlob);
+                if (FAILED(result)) {
+
+                    return FFX_ERROR_BACKEND_API_ERROR;
+                }
+
+                size_t blobSize = outBlob->GetBufferSize();
+                int64_t* blobData = (int64_t*)outBlob->GetBufferPointer();
+
+                result = dx12Device->CreateRootSignature(0, outBlob->GetBufferPointer(), outBlob->GetBufferSize(), IID_PPV_ARGS(reinterpret_cast<ID3D12RootSignature**>(&outPipeline->rootSignature)));
+                if (FAILED(result)) {
+
+                    return FFX_ERROR_BACKEND_API_ERROR;
+                }
+            } else {
+                return FFX_ERROR_BACKEND_API_ERROR;
+            }
+        } else {
             return FFX_ERROR_BACKEND_API_ERROR;
+        }
+    }
 
+    ID3D12RootSignature* dx12RootSignature = reinterpret_cast<ID3D12RootSignature*>(outPipeline->rootSignature);
+
+    // Only set the command signature if this is setup as an indirect workload
+    if (pipelineDescription->indirectWorkload)
+    {
+        D3D12_INDIRECT_ARGUMENT_DESC argumentDescs = { D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH };
+        D3D12_COMMAND_SIGNATURE_DESC commandSignatureDesc = {};
+        commandSignatureDesc.pArgumentDescs = &argumentDescs;
+        commandSignatureDesc.NumArgumentDescs = 1;
+        commandSignatureDesc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+
+        HRESULT result = dx12Device->CreateCommandSignature(&commandSignatureDesc, nullptr, IID_PPV_ARGS(reinterpret_cast<ID3D12CommandSignature**>(&outPipeline->cmdSignature)));
+        if (FAILED(result)) {
+
+            return FFX_ERROR_BACKEND_API_ERROR;
+        }
     }
     else
     {
-        FfxShaderBlob shaderBlob = {};
-        backendInterface->fpGetPermutationBlobByIndex(effect, pass, FFX_BIND_COMPUTE_SHADER_STAGE, permutationOptions, &shaderBlob);
-        FFX_ASSERT(shaderBlob.data&& shaderBlob.size);
-
-        // set up root signature
-        // easiest implementation: simply create one root signature per pipeline
-        // should add some management later on to avoid unnecessarily re-binding the root signature
-        {
-            FFX_ASSERT(pipelineDescription->samplerCount <= FFX_MAX_SAMPLERS);
-            const size_t              samplerCount = pipelineDescription->samplerCount;
-            D3D12_STATIC_SAMPLER_DESC dx12SamplerDescriptions[FFX_MAX_SAMPLERS];
-            for (uint32_t currentSamplerIndex = 0; currentSamplerIndex < samplerCount; ++currentSamplerIndex)
-            {
-                D3D12_STATIC_SAMPLER_DESC dx12SamplerDesc = {};
-
-                dx12SamplerDesc.ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
-                dx12SamplerDesc.MinLOD           = 0.f;
-                dx12SamplerDesc.MaxLOD           = D3D12_FLOAT32_MAX;
-                dx12SamplerDesc.MipLODBias       = 0.f;
-                dx12SamplerDesc.MaxAnisotropy    = 16;
-                dx12SamplerDesc.BorderColor      = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-                dx12SamplerDesc.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-                dx12SamplerDesc.AddressU         = FfxGetAddressModeDX12(pipelineDescription->samplers[currentSamplerIndex].addressModeU);
-                dx12SamplerDesc.AddressV         = FfxGetAddressModeDX12(pipelineDescription->samplers[currentSamplerIndex].addressModeV);
-                dx12SamplerDesc.AddressW         = FfxGetAddressModeDX12(pipelineDescription->samplers[currentSamplerIndex].addressModeW);
-
-                switch (pipelineDescription->samplers[currentSamplerIndex].filter)
-                {
-                case FFX_FILTER_TYPE_MINMAGMIP_POINT:
-                    dx12SamplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-                    break;
-                case FFX_FILTER_TYPE_MINMAGMIP_LINEAR:
-                    dx12SamplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-                    break;
-                case FFX_FILTER_TYPE_MINMAGLINEARMIP_POINT:
-                    dx12SamplerDesc.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-                    break;
-
-                default:
-                    FFX_ASSERT_MESSAGE(false, "Unsupported filter type requested. Please implement");
-                    break;
-                }
-
-                dx12SamplerDescriptions[currentSamplerIndex]                = dx12SamplerDesc;
-                dx12SamplerDescriptions[currentSamplerIndex].ShaderRegister = (UINT)currentSamplerIndex;
-            }
-
-            // storage for maximum number of descriptor ranges.
-            const int32_t          maximumDescriptorRangeSize             = 2;
-            D3D12_DESCRIPTOR_RANGE dx12Ranges[maximumDescriptorRangeSize] = {};
-            int32_t                currentDescriptorRangeIndex            = 0;
-
-            // storage for maximum number of root parameters.
-            const int32_t        maximumRootParameters                     = 10;
-            D3D12_ROOT_PARAMETER dx12RootParameters[maximumRootParameters] = {};
-            int32_t              currentRootParameterIndex                 = 0;
-
-            // Allocate a max of binding slots
-            int32_t uavCount = shaderBlob.uavBufferCount || shaderBlob.uavTextureCount ? FFX_MAX_RESOURCE_IDENTIFIER_COUNT : 0;
-            int32_t srvCount = shaderBlob.srvBufferCount || shaderBlob.srvTextureCount ? FFX_MAX_RESOURCE_IDENTIFIER_COUNT : 0;
-            if (uavCount > 0)
-            {
-                FFX_ASSERT(currentDescriptorRangeIndex < maximumDescriptorRangeSize);
-                D3D12_DESCRIPTOR_RANGE* dx12DescriptorRange = &dx12Ranges[currentDescriptorRangeIndex];
-                memset(dx12DescriptorRange, 0, sizeof(D3D12_DESCRIPTOR_RANGE));
-                dx12DescriptorRange->OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-                dx12DescriptorRange->RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-                dx12DescriptorRange->BaseShaderRegister                = 0;
-                dx12DescriptorRange->NumDescriptors                    = uavCount;
-                currentDescriptorRangeIndex++;
-
-                FFX_ASSERT(currentRootParameterIndex < maximumRootParameters);
-                D3D12_ROOT_PARAMETER* dx12RootParameterSlot = &dx12RootParameters[currentRootParameterIndex];
-                memset(dx12RootParameterSlot, 0, sizeof(D3D12_ROOT_PARAMETER));
-                dx12RootParameterSlot->ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-                dx12RootParameterSlot->DescriptorTable.NumDescriptorRanges = 1;
-                currentRootParameterIndex++;
-            }
-
-            if (srvCount > 0)
-            {
-                FFX_ASSERT(currentDescriptorRangeIndex < maximumDescriptorRangeSize);
-                D3D12_DESCRIPTOR_RANGE* dx12DescriptorRange = &dx12Ranges[currentDescriptorRangeIndex];
-                memset(dx12DescriptorRange, 0, sizeof(D3D12_DESCRIPTOR_RANGE));
-                dx12DescriptorRange->OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-                dx12DescriptorRange->RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-                dx12DescriptorRange->BaseShaderRegister                = 0;
-                dx12DescriptorRange->NumDescriptors                    = srvCount;
-                currentDescriptorRangeIndex++;
-
-                FFX_ASSERT(currentRootParameterIndex < maximumRootParameters);
-                D3D12_ROOT_PARAMETER* dx12RootParameterSlot = &dx12RootParameters[currentRootParameterIndex];
-                memset(dx12RootParameterSlot, 0, sizeof(D3D12_ROOT_PARAMETER));
-                dx12RootParameterSlot->ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-                dx12RootParameterSlot->DescriptorTable.NumDescriptorRanges = 1;
-                currentRootParameterIndex++;
-            }
-
-            // Setup the descriptor table bindings for the above
-            for (int32_t currentRangeIndex = 0; currentRangeIndex < currentDescriptorRangeIndex; currentRangeIndex++)
-            {
-                dx12RootParameters[currentRangeIndex].DescriptorTable.pDescriptorRanges = &dx12Ranges[currentRangeIndex];
-            }
-
-            // Setup root constants as push constants for dx12
-            FFX_ASSERT(pipelineDescription->rootConstantBufferCount <= FFX_MAX_NUM_CONST_BUFFERS);
-            size_t   rootConstantsSize = pipelineDescription->rootConstantBufferCount;
-            uint32_t rootConstants[FFX_MAX_NUM_CONST_BUFFERS];
-
-            for (uint32_t currentRootConstantIndex = 0; currentRootConstantIndex < pipelineDescription->rootConstantBufferCount; ++currentRootConstantIndex)
-            {
-                rootConstants[currentRootConstantIndex] = pipelineDescription->rootConstants[currentRootConstantIndex].size;
-            }
-
-            for (int32_t currentRootConstantIndex = 0; currentRootConstantIndex < (int32_t)pipelineDescription->rootConstantBufferCount;
-                 currentRootConstantIndex++)
-            {
-                FFX_ASSERT(currentRootParameterIndex < maximumRootParameters);
-                D3D12_ROOT_PARAMETER* rootParameterSlot = &dx12RootParameters[currentRootParameterIndex];
-                memset(rootParameterSlot, 0, sizeof(D3D12_ROOT_PARAMETER));
-                rootParameterSlot->ParameterType            = D3D12_ROOT_PARAMETER_TYPE_CBV;
-                rootParameterSlot->Constants.ShaderRegister = currentRootConstantIndex;
-                currentRootParameterIndex++;
-            }
-
-            D3D12_ROOT_SIGNATURE_DESC dx12RootSignatureDescription = {};
-            dx12RootSignatureDescription.NumParameters             = currentRootParameterIndex;
-            dx12RootSignatureDescription.pParameters               = dx12RootParameters;
-            dx12RootSignatureDescription.NumStaticSamplers         = (UINT)samplerCount;
-            dx12RootSignatureDescription.pStaticSamplers           = dx12SamplerDescriptions;
-
-            ID3DBlob* outBlob   = nullptr;
-            ID3DBlob* errorBlob = nullptr;
-
-            //Query D3D12SerializeRootSignature from d3d12.dll handle
-            typedef HRESULT(__stdcall * D3D12SerializeRootSignatureType)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
-
-            //Do not pass hD3D12 handle to the FreeLibrary function, as GetModuleHandle will not increment refcount
-            HMODULE d3d12ModuleHandle = GetModuleHandleW(L"D3D12.dll");
-
-            if (NULL != d3d12ModuleHandle)
-            {
-                D3D12SerializeRootSignatureType dx12SerializeRootSignatureType =
-                    (D3D12SerializeRootSignatureType)GetProcAddress(d3d12ModuleHandle, "D3D12SerializeRootSignature");
-
-                if (nullptr != dx12SerializeRootSignatureType)
-                {
-                    HRESULT result = dx12SerializeRootSignatureType(&dx12RootSignatureDescription, D3D_ROOT_SIGNATURE_VERSION_1, &outBlob, &errorBlob);
-                    if (FAILED(result))
-                    {
-                        return FFX_ERROR_BACKEND_API_ERROR;
-                    }
-
-                    size_t   blobSize = outBlob->GetBufferSize();
-                    int64_t* blobData = (int64_t*)outBlob->GetBufferPointer();
-
-                    result = dx12Device->CreateRootSignature(0,
-                                                             outBlob->GetBufferPointer(),
-                                                             outBlob->GetBufferSize(),
-                                                             IID_PPV_ARGS(reinterpret_cast<ID3D12RootSignature**>(&outPipeline->rootSignature)));
-                    if (FAILED(result))
-                    {
-                        return FFX_ERROR_BACKEND_API_ERROR;
-                    }
-                }
-                else
-                {
-                    return FFX_ERROR_BACKEND_API_ERROR;
-                }
-            }
-            else
-            {
-                return FFX_ERROR_BACKEND_API_ERROR;
-            }
-        }
-
-        ID3D12RootSignature* dx12RootSignature = reinterpret_cast<ID3D12RootSignature*>(outPipeline->rootSignature);
-
-        // Only set the command signature if this is setup as an indirect workload
-        if (pipelineDescription->indirectWorkload)
-        {
-            D3D12_INDIRECT_ARGUMENT_DESC argumentDescs        = {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
-            D3D12_COMMAND_SIGNATURE_DESC commandSignatureDesc = {};
-            commandSignatureDesc.pArgumentDescs               = &argumentDescs;
-            commandSignatureDesc.NumArgumentDescs             = 1;
-            commandSignatureDesc.ByteStride                   = sizeof(D3D12_DISPATCH_ARGUMENTS);
-
-            HRESULT result = dx12Device->CreateCommandSignature(
-                &commandSignatureDesc, nullptr, IID_PPV_ARGS(reinterpret_cast<ID3D12CommandSignature**>(&outPipeline->cmdSignature)));
-            if (FAILED(result))
-            {
-                return FFX_ERROR_BACKEND_API_ERROR;
-            }
-        }
-        else
-        {
-            outPipeline->cmdSignature = nullptr;
-        }
-
-        // populate the pass.
-        outPipeline->srvTextureCount = shaderBlob.srvTextureCount;
-        outPipeline->uavTextureCount = shaderBlob.uavTextureCount;
-        outPipeline->srvBufferCount  = shaderBlob.srvBufferCount;
-        outPipeline->uavBufferCount  = shaderBlob.uavBufferCount;
-
-        // Todo when needed
-        //outPipeline->samplerCount      = shaderBlob.samplerCount;
-        //outPipeline->rtAccelStructCount= shaderBlob.rtAccelStructCount;
-
-        outPipeline->constCount = shaderBlob.cbvCount;
-        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-        for (uint32_t srvIndex = 0; srvIndex < outPipeline->srvTextureCount; ++srvIndex)
-        {
-            outPipeline->srvTextureBindings[srvIndex].slotIndex = shaderBlob.boundSRVTextures[srvIndex];
-            outPipeline->srvTextureBindings[srvIndex].bindCount = shaderBlob.boundSRVTextureCounts[srvIndex];
-            wcscpy_s(outPipeline->srvTextureBindings[srvIndex].name, converter.from_bytes(shaderBlob.boundSRVTextureNames[srvIndex]).c_str());
-        }
-        for (uint32_t uavIndex = 0; uavIndex < outPipeline->uavTextureCount; ++uavIndex)
-        {
-            outPipeline->uavTextureBindings[uavIndex].slotIndex = shaderBlob.boundUAVTextures[uavIndex];
-            outPipeline->uavTextureBindings[uavIndex].bindCount = shaderBlob.boundUAVTextureCounts[uavIndex];
-            wcscpy_s(outPipeline->uavTextureBindings[uavIndex].name, converter.from_bytes(shaderBlob.boundUAVTextureNames[uavIndex]).c_str());
-        }
-        for (uint32_t srvIndex = 0; srvIndex < outPipeline->srvBufferCount; ++srvIndex)
-        {
-            outPipeline->srvBufferBindings[srvIndex].slotIndex = shaderBlob.boundSRVBuffers[srvIndex];
-            outPipeline->srvBufferBindings[srvIndex].bindCount = shaderBlob.boundSRVBufferCounts[srvIndex];
-            wcscpy_s(outPipeline->srvBufferBindings[srvIndex].name, converter.from_bytes(shaderBlob.boundSRVBufferNames[srvIndex]).c_str());
-        }
-        for (uint32_t uavIndex = 0; uavIndex < outPipeline->uavBufferCount; ++uavIndex)
-        {
-            outPipeline->uavBufferBindings[uavIndex].slotIndex = shaderBlob.boundUAVBuffers[uavIndex];
-            outPipeline->uavBufferBindings[uavIndex].bindCount = shaderBlob.boundUAVBufferCounts[uavIndex];
-            wcscpy_s(outPipeline->uavBufferBindings[uavIndex].name, converter.from_bytes(shaderBlob.boundUAVBufferNames[uavIndex]).c_str());
-        }
-        for (uint32_t cbIndex = 0; cbIndex < outPipeline->constCount; ++cbIndex)
-        {
-            outPipeline->constantBufferBindings[cbIndex].slotIndex = shaderBlob.boundConstantBuffers[cbIndex];
-            outPipeline->constantBufferBindings[cbIndex].bindCount = shaderBlob.boundConstantBufferCounts[cbIndex];
-            wcscpy_s(outPipeline->constantBufferBindings[cbIndex].name, converter.from_bytes(shaderBlob.boundConstantBufferNames[cbIndex]).c_str());
-        }
-
-        // create the PSO
-        D3D12_COMPUTE_PIPELINE_STATE_DESC dx12PipelineStateDescription = {};
-        dx12PipelineStateDescription.Flags                             = D3D12_PIPELINE_STATE_FLAG_NONE;
-        dx12PipelineStateDescription.pRootSignature                    = dx12RootSignature;
-        dx12PipelineStateDescription.CS.pShaderBytecode                = shaderBlob.data;
-        dx12PipelineStateDescription.CS.BytecodeLength                 = shaderBlob.size;
-
-        if (FAILED(dx12Device->CreateComputePipelineState(&dx12PipelineStateDescription,
-                                                          IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&outPipeline->pipeline)))))
-            return FFX_ERROR_BACKEND_API_ERROR;
-
-        // Set the pipeline name
-        reinterpret_cast<ID3D12PipelineState*>(outPipeline->pipeline)->SetName(pipelineDescription->name);
+        outPipeline->cmdSignature = nullptr;
     }
+
+    // populate the pass.
+    outPipeline->srvTextureCount = shaderBlob.srvTextureCount;
+    outPipeline->uavTextureCount = shaderBlob.uavTextureCount;
+    outPipeline->srvBufferCount  = shaderBlob.srvBufferCount;
+    outPipeline->uavBufferCount  = shaderBlob.uavBufferCount;
+
+    // Todo when needed
+    //outPipeline->samplerCount      = shaderBlob.samplerCount;
+    //outPipeline->rtAccelStructCount= shaderBlob.rtAccelStructCount;
+
+    outPipeline->constCount = shaderBlob.cbvCount;
+    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
+    for (uint32_t srvIndex = 0; srvIndex < outPipeline->srvTextureCount; ++srvIndex)
+    {
+        outPipeline->srvTextureBindings[srvIndex].slotIndex = shaderBlob.boundSRVTextures[srvIndex];
+        outPipeline->srvTextureBindings[srvIndex].bindCount = shaderBlob.boundSRVTextureCounts[srvIndex];
+        wcscpy_s(outPipeline->srvTextureBindings[srvIndex].name, converter.from_bytes(shaderBlob.boundSRVTextureNames[srvIndex]).c_str());
+    }
+    for (uint32_t uavIndex = 0; uavIndex < outPipeline->uavTextureCount; ++uavIndex)
+    {
+        outPipeline->uavTextureBindings[uavIndex].slotIndex = shaderBlob.boundUAVTextures[uavIndex];
+        outPipeline->uavTextureBindings[uavIndex].bindCount = shaderBlob.boundUAVTextureCounts[uavIndex];
+        wcscpy_s(outPipeline->uavTextureBindings[uavIndex].name, converter.from_bytes(shaderBlob.boundUAVTextureNames[uavIndex]).c_str());
+    }
+    for (uint32_t srvIndex = 0; srvIndex < outPipeline->srvBufferCount; ++srvIndex)
+    {
+        outPipeline->srvBufferBindings[srvIndex].slotIndex = shaderBlob.boundSRVBuffers[srvIndex];
+        outPipeline->srvBufferBindings[srvIndex].bindCount = shaderBlob.boundSRVBufferCounts[srvIndex];
+        wcscpy_s(outPipeline->srvBufferBindings[srvIndex].name, converter.from_bytes(shaderBlob.boundSRVBufferNames[srvIndex]).c_str());
+    }
+    for (uint32_t uavIndex = 0; uavIndex < outPipeline->uavBufferCount; ++uavIndex)
+    {
+        outPipeline->uavBufferBindings[uavIndex].slotIndex = shaderBlob.boundUAVBuffers[uavIndex];
+        outPipeline->uavBufferBindings[uavIndex].bindCount = shaderBlob.boundUAVBufferCounts[uavIndex];
+        wcscpy_s(outPipeline->uavBufferBindings[uavIndex].name, converter.from_bytes(shaderBlob.boundUAVBufferNames[uavIndex]).c_str());
+    }
+    for (uint32_t cbIndex = 0; cbIndex < outPipeline->constCount; ++cbIndex)
+    {
+        outPipeline->constantBufferBindings[cbIndex].slotIndex = shaderBlob.boundConstantBuffers[cbIndex];
+        outPipeline->constantBufferBindings[cbIndex].bindCount = shaderBlob.boundConstantBufferCounts[cbIndex];
+        wcscpy_s(outPipeline->constantBufferBindings[cbIndex].name, converter.from_bytes(shaderBlob.boundConstantBufferNames[cbIndex]).c_str());
+    }
+
+    // create the PSO
+    D3D12_COMPUTE_PIPELINE_STATE_DESC dx12PipelineStateDescription = {};
+    dx12PipelineStateDescription.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+    dx12PipelineStateDescription.pRootSignature = dx12RootSignature;
+    dx12PipelineStateDescription.CS.pShaderBytecode = shaderBlob.data;
+    dx12PipelineStateDescription.CS.BytecodeLength = shaderBlob.size;
+
+    if (FAILED(dx12Device->CreateComputePipelineState(&dx12PipelineStateDescription, IID_PPV_ARGS(reinterpret_cast<ID3D12PipelineState**>(&outPipeline->pipeline)))))
+        return FFX_ERROR_BACKEND_API_ERROR;
+
+    // Set the pipeline name
+    reinterpret_cast<ID3D12PipelineState*>(outPipeline->pipeline)->SetName(pipelineDescription->name);
+
     return FFX_OK;
 }
 
@@ -2333,7 +1732,7 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_DX12* backendContext, Ff
         if (maximumUavIndex)
         {
             // check if this fits into the ringbuffer, loop if not fitting
-            if (backendContext->descRingBufferBase + maximumUavIndex + 1 > FFX_RING_BUFFER_SIZE * backendContext->maxEffectContexts)
+            if (backendContext->descRingBufferBase + maximumUavIndex + 1 > FFX_RING_BUFFER_SIZE * s_MaxEffectContexts)
                 backendContext->descRingBufferBase = 0;
 
             D3D12_GPU_DESCRIPTOR_HANDLE gpuView = dx12DescriptorHeap->GetGPUDescriptorHandleForHeapStart();
@@ -2414,7 +1813,7 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_DX12* backendContext, Ff
         if (maximumSrvIndex)
         {
             // check if this fits into the ringbuffer, loop if not fitting
-            if (backendContext->descRingBufferBase + maximumSrvIndex + 1 > FFX_RING_BUFFER_SIZE * backendContext->maxEffectContexts) {
+            if (backendContext->descRingBufferBase + maximumSrvIndex + 1 > FFX_RING_BUFFER_SIZE * s_MaxEffectContexts) {
 
                 backendContext->descRingBufferBase = 0;
             }
@@ -2497,7 +1896,6 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_DX12* backendContext, Ff
 
     // copy data to constant buffer and bind
     {
-        std::lock_guard<std::mutex> cbLock{backendContext->constantBufferMutex};
         for (uint32_t currentRootConstantIndex = 0; currentRootConstantIndex < job->computeJobDescriptor.pipeline.constCount; ++currentRootConstantIndex) {
 
             uint32_t size = FFX_ALIGN_UP(job->computeJobDescriptor.cbs[currentRootConstantIndex].num32BitEntries * sizeof(uint32_t), 256);
@@ -2508,9 +1906,8 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_DX12* backendContext, Ff
             void* pBuffer = (void*)((uint8_t*)(backendContext->constantBufferMem) + backendContext->constantBufferOffset);
             memcpy(pBuffer, job->computeJobDescriptor.cbs[currentRootConstantIndex].data, job->computeJobDescriptor.cbs[currentRootConstantIndex].num32BitEntries * sizeof(uint32_t));
 
-            uint32_t slotIndex = job->computeJobDescriptor.pipeline.constantBufferBindings[currentRootConstantIndex].slotIndex;
             D3D12_GPU_VIRTUAL_ADDRESS bufferViewDesc = backendContext->constantBufferResource->GetGPUVirtualAddress() + backendContext->constantBufferOffset;
-            dx12CommandList->SetComputeRootConstantBufferView(descriptorTableIndex + slotIndex, bufferViewDesc);
+            dx12CommandList->SetComputeRootConstantBufferView(descriptorTableIndex + currentRootConstantIndex, bufferViewDesc);
 
             // update the offset
             backendContext->constantBufferOffset += size;
@@ -2585,22 +1982,6 @@ static FfxErrorCode executeGpuJobCopy(BackendContext_DX12* backendContext, FfxGp
     return FFX_OK;
 }
 
-static FfxErrorCode executeGpuJobBarrier(BackendContext_DX12* backendContext, FfxGpuJobDescription* job, ID3D12Device* dx12Device, ID3D12GraphicsCommandList* dx12CommandList)
-{
-    ID3D12Resource* dx12ResourceSrc = getDX12ResourcePtr(backendContext, job->barrierDescriptor.resource.internalIndex);
-    D3D12_RESOURCE_DESC dx12ResourceDescriptionSrc = dx12ResourceSrc->GetDesc();
-
-    addBarrier(backendContext, &job->barrierDescriptor.resource, job->barrierDescriptor.newState);
-    flushBarriers(backendContext, dx12CommandList);
-
-    return FFX_OK;
-}
-
-static FfxErrorCode executeGpuJobTimestamp(BackendContext_DX12* backendContext, FfxGpuJobDescription* job, ID3D12Device* dx12Device, ID3D12GraphicsCommandList* dx12CommandList)
-{
-    return FFX_OK;
-}
-
 static FfxErrorCode executeGpuJobClearFloat(BackendContext_DX12* backendContext, FfxGpuJobDescription* job, ID3D12Device* dx12Device, ID3D12GraphicsCommandList* dx12CommandList)
 {
     uint32_t idx = job->clearJobDescriptor.target.internalIndex;
@@ -2619,12 +2000,8 @@ static FfxErrorCode executeGpuJobClearFloat(BackendContext_DX12* backendContext,
 
     addBarrier(backendContext, &job->clearJobDescriptor.target, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
     flushBarriers(backendContext, dx12CommandList);
-    uint32_t clearColorAsUint[4];
-    clearColorAsUint[0] = reinterpret_cast<uint32_t&> (job->clearJobDescriptor.color[0]);
-    clearColorAsUint[1] = reinterpret_cast<uint32_t&> (job->clearJobDescriptor.color[1]);
-    clearColorAsUint[2] = reinterpret_cast<uint32_t&> (job->clearJobDescriptor.color[2]);
-    clearColorAsUint[3] = reinterpret_cast<uint32_t&> (job->clearJobDescriptor.color[3]);
-    dx12CommandList->ClearUnorderedAccessViewUint(dx12GpuHandle, dx12CpuHandle, dx12Resource, clearColorAsUint, 0, nullptr);
+
+    dx12CommandList->ClearUnorderedAccessViewFloat(dx12GpuHandle, dx12CpuHandle, dx12Resource, job->clearJobDescriptor.color, 0, nullptr);
 
     return FFX_OK;
 }
@@ -2660,10 +2037,6 @@ FfxErrorCode ExecuteGpuJobsDX12(
                 errorCode = executeGpuJobCompute(backendContext, GpuJob, dx12Device, dx12CommandList);
                 break;
 
-            case FFX_GPU_JOB_BARRIER:
-                errorCode = executeGpuJobBarrier(backendContext, GpuJob, dx12Device, dx12CommandList);
-                break;
-
             default:
                 break;
         }
@@ -2677,95 +2050,4 @@ FfxErrorCode ExecuteGpuJobsDX12(
     backendContext->gpuJobCount = 0;
 
     return FFX_OK;
-}
-
-FfxCommandQueue ffxGetCommandQueueDX12(ID3D12CommandQueue* pCommandQueue)
-{
-    FFX_ASSERT(nullptr != pCommandQueue);
-    return reinterpret_cast<FfxCommandQueue>(pCommandQueue);
-}
-
-FfxSwapchain ffxGetSwapchainDX12(IDXGISwapChain4* pSwapchain)
-{
-    FFX_ASSERT(nullptr != pSwapchain);
-    return reinterpret_cast<FfxSwapchain>(pSwapchain);
-}
-
-IDXGISwapChain4* ffxGetDX12SwapchainPtr(FfxSwapchain ffxSwapchain)
-{
-    return reinterpret_cast<IDXGISwapChain4*>(ffxSwapchain);
-}
-
-#include <FidelityFX/host/ffx_fsr2.h>
-#include <FidelityFX/host/ffx_fsr3.h>
-#include "FrameInterpolationSwapchain/FrameInterpolationSwapchainDX12.h"
-
-
-// fix up format in case resource passed to FSR2 was created as typeless
-static DXGI_FORMAT convertFormat(DXGI_FORMAT format)
-{
-    switch (format)
-    {
-    // Handle Depth
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-    case DXGI_FORMAT_D32_FLOAT:
-        return DXGI_FORMAT_R32_FLOAT;
-    case DXGI_FORMAT_R24G8_TYPELESS:
-    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
-    case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    case DXGI_FORMAT_D16_UNORM:
-        return DXGI_FORMAT_R16_UNORM;
-
-    // Handle color: assume FLOAT for 16 and 32 bit channels, else UNORM
-    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-        return DXGI_FORMAT_R32G32B32A32_FLOAT;
-    case DXGI_FORMAT_R32G32B32_TYPELESS:
-        return DXGI_FORMAT_R32G32B32_FLOAT;
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-        return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case DXGI_FORMAT_R32G32_TYPELESS:
-        return DXGI_FORMAT_R32G32_FLOAT;
-    case DXGI_FORMAT_R16G16_TYPELESS:
-        return DXGI_FORMAT_R16G16_FLOAT;
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-        return DXGI_FORMAT_R10G10B10A2_UNORM;
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-        return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-        return DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
-    case DXGI_FORMAT_R32_TYPELESS:
-        return DXGI_FORMAT_R32_FLOAT;
-    case DXGI_FORMAT_R8G8_TYPELESS:
-        return DXGI_FORMAT_R8G8_UNORM;
-    case DXGI_FORMAT_R16_TYPELESS:
-        return DXGI_FORMAT_R16_FLOAT;
-    case DXGI_FORMAT_R8_TYPELESS:
-        return DXGI_FORMAT_R8_UNORM;
-    default:
-        return format;
-    }
-}
-
-static DXGI_FORMAT sRgbFormat(DXGI_FORMAT format)
-{
-    switch (format)
-    {
-    case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-    case DXGI_FORMAT_B8G8R8A8_UNORM:
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-        return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-    case DXGI_FORMAT_B8G8R8X8_UNORM:
-    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-        return DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
-    default:
-        return format;
-    }
 }
